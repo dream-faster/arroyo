@@ -718,6 +718,9 @@ impl KafkaTester {
             Format::RawBytes(_) => {
                 // all bytes are valid
             }
+            Format::Flatbuffers(_) => {
+                bail!("Flatbuffers messages are only supported by the NATS connector");
+            }
             Format::Protobuf(_) => {
                 let aschema: ArroyoSchema = schema.clone().into();
                 let mut deserializer = ArrowDeserializer::new(

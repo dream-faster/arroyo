@@ -118,6 +118,9 @@ impl ArrowSerializer {
         match &self.format {
             Format::Json(json) => self.serialize_json(json, &batch),
             Format::Avro(avro) => self.serialize_avro(avro, &batch),
+            Format::Flatbuffers(_) => {
+                unreachable!("flatbuffers is handled directly by the NATS connector")
+            }
             Format::Parquet(_) => todo!("parquet"),
             Format::RawString(RawStringFormat {}) => self.serialize_raw_string(&batch),
             Format::RawBytes(RawBytesFormat {}) => self.serialize_raw_bytes(&batch),
