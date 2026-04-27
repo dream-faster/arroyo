@@ -10,8 +10,8 @@ use arroyo_rpc::{
     TIMESTAMP_FIELD,
     df::{ArroyoSchema, ArroyoSchemaRef},
     grpc::api::{
-        SessionWindowAggregateOperator, SlidingWindowAggregateOperator,
-        TumblingWindowAggregateOperator,
+        DuckdbTumblingWindowAggregateOperator, SessionWindowAggregateOperator,
+        SlidingWindowAggregateOperator, TumblingWindowAggregateOperator,
     },
 };
 use datafusion::common::{
@@ -23,6 +23,7 @@ use datafusion::logical_expr::{
     Aggregate, BinaryExpr, Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore,
     expr::ScalarFunction,
 };
+use datafusion::sql::unparser::expr_to_sql;
 use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
 use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
@@ -288,6 +289,91 @@ impl AggregateExtension {
         ))
     }
 
+    pub fn duckdb_tumbling_window_config(
+        &self,
+        planner: &Planner,
+        index: usize,
+        input_schema: DFSchemaRef,
+        width: Duration,
+    ) -> Result<LogicalNode> {
+        let binning_function_proto = planner.binning_function_proto(width, input_schema.clone())?;
+
+        let sql_query = self.generate_duckdb_sql("input")?;
+
+        let config = DuckdbTumblingWindowAggregateOperator {
+            name: "DuckdbTumblingWindow".to_string(),
+            width_micros: width.as_micros() as u64,
+            binning_function: binning_function_proto.encode_to_vec(),
+            input_schema: Some(
+                ArroyoSchema::from_schema_keys(
+                    Arc::new(input_schema.as_ref().into()),
+                    self.key_fields.clone(),
+                )?
+                .into(),
+            ),
+            sql_query,
+            input_table_name: "input".to_string(),
+        };
+
+        Ok(LogicalNode::single(
+            index as u32,
+            format!("duckdb_tumbling_{index}"),
+            OperatorName::DuckdbTumblingWindowAggregate,
+            config.encode_to_vec(),
+            format!("DuckdbTumblingWindow<{width:?}>"),
+            1,
+        ))
+    }
+
+    /// Reconstruct a DuckDB-compatible SQL query from the DataFusion aggregate logical plan.
+    ///
+    /// The generated query references `input_table_name` as its sole FROM table.  Group-by fields
+    /// are taken directly by name; aggregate expressions are converted via DataFusion's SQL
+    /// unparser so that standard SQL functions (COUNT, SUM, AVG, …) translate correctly.
+    fn generate_duckdb_sql(&self, input_table_name: &str) -> Result<String> {
+        let LogicalPlan::Aggregate(agg) = &self.aggregate else {
+            return plan_err!("expected Aggregate plan inside AggregateExtension");
+        };
+
+        let key_count = self.key_fields.len();
+        let schema_fields = agg.schema.fields();
+
+        let mut select_parts: Vec<String> = Vec::new();
+
+        // Group-by columns.  The schema holds the *output* names (e.g. "event_type"), which are
+        // the actual column names in the raw input table registered with DuckDB.
+        for i in 0..key_count {
+            select_parts.push(quote_duckdb_ident(schema_fields[i].name()));
+        }
+
+        // Aggregate expressions.  Use DataFusion's SQL unparser so we get standard SQL that
+        // DuckDB understands (COUNT(*), SUM("x"), etc.).
+        for (i, aggr_expr) in agg.aggr_expr.iter().enumerate() {
+            let output_name = schema_fields[key_count + i].name();
+            let sql_expr = expr_to_sql(aggr_expr)
+                .map(|e| e.to_string())
+                .unwrap_or_else(|_| format!("{aggr_expr}"));
+            select_parts.push(format!(
+                "{sql_expr} AS {}",
+                quote_duckdb_ident(output_name)
+            ));
+        }
+
+        let table_ref = quote_duckdb_ident(input_table_name);
+        if key_count == 0 {
+            Ok(format!("SELECT {} FROM {table_ref}", select_parts.join(", ")))
+        } else {
+            let group_by: Vec<String> = (0..key_count)
+                .map(|i| quote_duckdb_ident(schema_fields[i].name()))
+                .collect();
+            Ok(format!(
+                "SELECT {} FROM {table_ref} GROUP BY {}",
+                select_parts.join(", "),
+                group_by.join(", ")
+            ))
+        }
+    }
+
     // projection assuming that _timestamp has been populated with the start of the bin.
     pub fn final_projection(
         aggregate_plan: &LogicalPlan,
@@ -523,7 +609,21 @@ impl ArroyoExtension for AggregateExtension {
                 } else {
                     match window {
                         WindowType::Tumbling { width } => {
-                            self.tumbling_window_config(planner, index, input_df_schema, *width)?
+                            if planner.use_duckdb_aggregation() {
+                                self.duckdb_tumbling_window_config(
+                                    planner,
+                                    index,
+                                    input_df_schema,
+                                    *width,
+                                )?
+                            } else {
+                                self.tumbling_window_config(
+                                    planner,
+                                    index,
+                                    input_df_schema,
+                                    *width,
+                                )?
+                            }
                         }
                         WindowType::Sliding { width, slide } => self.sliding_window_config(
                             planner,
@@ -620,4 +720,8 @@ impl UserDefinedLogicalNodeCore for WindowAppendExtension {
             self.window_index,
         ))
     }
+}
+
+fn quote_duckdb_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }

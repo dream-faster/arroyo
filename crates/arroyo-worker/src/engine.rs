@@ -1,4 +1,5 @@
 use crate::arrow::async_udf::AsyncUdfConstructor;
+use crate::arrow::duckdb_tumbling_window::DuckdbTumblingWindowConstructor;
 use crate::arrow::incremental_aggregator::IncrementalAggregatingConstructor;
 use crate::arrow::instant_join::InstantJoinConstructor;
 use crate::arrow::join_with_expiration::JoinWithExpirationConstructor;
@@ -890,6 +891,7 @@ pub fn construct_operator(
         OperatorName::Projection => Box::new(ProjectionConstructor),
         OperatorName::AsyncUdf => Box::new(AsyncUdfConstructor),
         OperatorName::TumblingWindowAggregate => Box::new(TumblingAggregateWindowConstructor),
+        OperatorName::DuckdbTumblingWindowAggregate => Box::new(DuckdbTumblingWindowConstructor),
         OperatorName::SlidingWindowAggregate => Box::new(SlidingAggregatingWindowConstructor),
         OperatorName::SessionWindowAggregate => Box::new(SessionAggregatingWindowConstructor),
         OperatorName::UpdatingAggregate => Box::new(IncrementalAggregatingConstructor),

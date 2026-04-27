@@ -1042,6 +1042,7 @@ dependencies = [
  "bytes",
  "datafusion",
  "datafusion-proto",
+ "duckdb",
  "futures",
  "itertools 0.12.1",
  "mini-moka",

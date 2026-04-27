@@ -738,6 +738,11 @@ async fn get_graph(query_string: String, udfs: &[LocalUdf]) -> Result<LogicalPro
             .unwrap();
     }
 
+    // Enable DuckDB-backed tumbling window aggregation when the SQL starts with `--duckdb`.
+    if query_string.trim_start().starts_with("--duckdb") {
+        schema_provider.planning_options.use_duckdb_aggregation = true;
+    }
+
     // TODO: test with higher parallelism
     let program = parse_and_get_arrow_program(
         query_string,

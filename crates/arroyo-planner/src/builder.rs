@@ -86,6 +86,10 @@ impl<'a> Planner<'a> {
         }
     }
 
+    pub(crate) fn use_duckdb_aggregation(&self) -> bool {
+        self.schema_provider.planning_options.use_duckdb_aggregation
+    }
+
     pub(crate) fn sync_plan(&self, plan: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let fut = self.planner.create_physical_plan(plan, self.session_state);
         let (tx, mut rx) = oneshot::channel();

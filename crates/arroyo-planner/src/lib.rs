@@ -97,12 +97,14 @@ pub struct CompiledSql {
 #[derive(Clone)]
 pub struct PlanningOptions {
     ttl: Duration,
+    pub use_duckdb_aggregation: bool,
 }
 
 impl Default for PlanningOptions {
     fn default() -> Self {
         Self {
             ttl: Duration::from_secs(24 * 60 * 60),
+            use_duckdb_aggregation: false,
         }
     }
 }

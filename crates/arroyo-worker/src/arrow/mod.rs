@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 pub mod async_udf;
+pub mod duckdb_tumbling_window;
 pub mod incremental_aggregator;
 pub mod instant_join;
 pub mod join_with_expiration;
