@@ -405,6 +405,8 @@ impl NatsSourceFunc {
                                         message_info.delivered
                                     );
 
+                                    // Flatbuffers payloads are decoded directly into record batches,
+                                    // so there is no row-wise deserializer buffer to flush.
                                     if !flatbuffers && collector.should_flush() {
                                         collector.flush_buffer().await?;
                                     }
@@ -496,6 +498,8 @@ impl NatsSourceFunc {
                                     } else {
                                         collector.deserialize_slice(payload, timestamp, None).await?;
                                     }
+                                    // Flatbuffers payloads are decoded directly into record batches,
+                                    // so there is no row-wise deserializer buffer to flush.
                                     if !flatbuffers && collector.should_flush() {
                                         collector.flush_buffer().await?;
                                     }

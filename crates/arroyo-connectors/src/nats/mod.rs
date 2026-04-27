@@ -1,4 +1,4 @@
-use crate::nats::sink::NatsSinkFunc;
+use crate::nats::sink::{NatsSinkEncoder, NatsSinkFunc};
 use crate::nats::source::NatsSourceFunc;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -342,7 +342,7 @@ impl Connector for NatsConnector {
                 }))
             }
             ConnectorType::Sink { ref sink_type } => {
-                let format = config.format.expect("Format must be set for NATS source");
+                let format = config.format.expect("Format must be set for NATS sink");
                 ConstructedOperator::from_operator(Box::new(NatsSinkFunc {
                     sink_type: sink_type
                         .clone()
@@ -355,9 +355,12 @@ impl Connector for NatsConnector {
                     connection: profile.clone(),
                     table: table.clone(),
                     publisher: None,
-                    serializer: (!matches!(format, Format::Flatbuffers(_)))
-                        .then(|| arroyo_formats::ser::ArrowSerializer::new(format.clone())),
-                    format,
+                    encoder: match &format {
+                        Format::Flatbuffers(_) => NatsSinkEncoder::Flatbuffers,
+                        _ => NatsSinkEncoder::Serializer(
+                            arroyo_formats::ser::ArrowSerializer::new(format.clone()),
+                        ),
+                    },
                 }))
             }
         })

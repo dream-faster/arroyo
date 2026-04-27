@@ -6,7 +6,6 @@ use arroyo_formats::ser::ArrowSerializer;
 use arroyo_operator::context::{Collector, OperatorContext};
 use arroyo_operator::operator::ArrowOperator;
 use arroyo_rpc::errors::DataflowResult;
-use arroyo_rpc::formats::Format;
 use arroyo_rpc::grpc::rpc::TableConfig;
 use arroyo_types::*;
 use async_trait::async_trait;
@@ -15,14 +14,18 @@ use std::collections::HashMap;
 #[cfg(test)]
 mod test;
 
+pub enum NatsSinkEncoder {
+    Flatbuffers,
+    Serializer(ArrowSerializer),
+}
+
 pub struct NatsSinkFunc {
     pub sink_type: SinkType,
     pub servers: String,
     pub connection: NatsConfig,
     pub table: NatsTable,
     pub publisher: Option<async_nats::Client>,
-    pub format: Format,
-    pub serializer: Option<ArrowSerializer>,
+    pub encoder: NatsSinkEncoder,
 }
 
 #[async_trait]
@@ -84,20 +87,15 @@ impl ArrowOperator for NatsSinkFunc {
     ) -> DataflowResult<()> {
         let SinkType::Subject(s) = &self.sink_type;
         let nats_subject = async_nats::Subject::from(s.clone());
-        let messages = match &self.format {
-            Format::Flatbuffers(_) => match encode_flatbuffers_message(&batch) {
+        let messages = match &mut self.encoder {
+            NatsSinkEncoder::Flatbuffers => match encode_flatbuffers_message(&batch) {
                 Ok(message) => vec![message],
                 Err(e) => {
                     ctx.report_error(e.to_string(), format!("{e:?}")).await;
                     panic!("Panicked while processing element: {e}");
                 }
             },
-            _ => self
-                .serializer
-                .as_mut()
-                .expect("serializer must be configured for non-flatbuffers NATS sinks")
-                .serialize(&batch)
-                .collect(),
+            NatsSinkEncoder::Serializer(serializer) => serializer.serialize(&batch).collect(),
         };
 
         for msg in messages {

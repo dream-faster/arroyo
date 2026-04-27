@@ -1,11 +1,10 @@
-use super::NatsSinkFunc;
+use super::{NatsSinkEncoder, NatsSinkFunc};
 use crate::nats::{
     ConnectorType, NatsConfig, NatsConfigAuthentication, NatsTable, SinkType,
     encode_flatbuffers_message,
 };
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arroyo_rpc::formats::{FlatbuffersFormat, Format};
 use arroyo_rpc::var_str::VarStr;
 use std::sync::Arc;
 
@@ -32,11 +31,10 @@ fn flatbuffers_sink_messages_roundtrip() {
             },
         },
         publisher: None,
-        format: Format::Flatbuffers(FlatbuffersFormat {}),
-        serializer: None,
+        encoder: NatsSinkEncoder::Flatbuffers,
     };
 
-    assert!(sink.serializer.is_none());
+    assert!(matches!(sink.encoder, NatsSinkEncoder::Flatbuffers));
 
     let batch = RecordBatch::try_new(
         schema(),
