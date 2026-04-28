@@ -76,51 +76,51 @@ jobs:
                   text=True,
               )
           )
-           packages = sorted(
-               pkg["name"]
-               for pkg in data["packages"]
-               if pkg["name"] != "integ"
-           )
-           bundled_packages = [
-               ("fast-foundation", [
-                   "arroyo-metrics",
-                   "arroyo-types",
-                   "arroyo-udf-common",
-                   "arroyo-udf-macros",
-               ]),
-               ("fast-runtime", [
-                   "arroyo-compiler-service",
-                   "arroyo-rpc",
-                   "arroyo-state",
-                   "arroyo-storage",
-                   "arroyo-udf-host",
-               ]),
-           ]
-           grouped = []
-           assigned = set()
-           for name, group_packages in bundled_packages:
-               present = [pkg for pkg in group_packages if pkg in packages]
-               if not present:
-                   continue
-               grouped.append(
-                   {
-                       "name": name,
-                       "package_args": " ".join(f"--package {pkg}" for pkg in present),
-                   }
-               )
-               assigned.update(present)
-           grouped.extend(
-               {
-                   "name": pkg,
-                   "package_args": f"--package {pkg}",
-               }
-               for pkg in packages
-               if pkg not in assigned
-           )
-           print(json.dumps(grouped))
-           PY
-           )
-           echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          packages = sorted(
+              pkg["name"]
+              for pkg in data["packages"]
+              if pkg["name"] != "integ"
+          )
+          bundled_packages = [
+              ("fast-foundation", [
+                  "arroyo-metrics",
+                  "arroyo-types",
+                  "arroyo-udf-common",
+                  "arroyo-udf-macros",
+              ]),
+              ("fast-runtime", [
+                  "arroyo-compiler-service",
+                  "arroyo-rpc",
+                  "arroyo-state",
+                  "arroyo-storage",
+                  "arroyo-udf-host",
+              ]),
+          ]
+          grouped = []
+          assigned = set()
+          for name, group_packages in bundled_packages:
+              present = [pkg for pkg in group_packages if pkg in packages]
+              if not present:
+                  continue
+              grouped.append(
+                  {
+                      "name": name,
+                      "package_args": " ".join(f"--package {pkg}" for pkg in present),
+                  }
+              )
+              assigned.update(present)
+          grouped.extend(
+              {
+                  "name": pkg,
+                  "package_args": f"--package {pkg}",
+              }
+              for pkg in packages
+              if pkg not in assigned
+          )
+          print(json.dumps(grouped))
+          PY
+          )
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
 
   rust-format:
     needs: changes
