@@ -10,6 +10,7 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+*' # Semver matching pattern with optional suffix
 
 permissions:
+  contents: read
   packages: write
 
 jobs:
@@ -28,6 +29,8 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runs_on }}
     steps:
+      - name: Check out
+        uses: actions/checkout@v4
       - name: Prepare
         id: prepare
         run: |
@@ -181,6 +184,7 @@ jobs:
         working-directory: /tmp/digests/${{ matrix.image_name }}
         run: |          
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ steps.prepare.outputs.image_namespace }}/${{ matrix.image_name }}@sha256:%s ' *)
             $(printf 'ghcr.io/${{ steps.prepare.outputs.image_namespace }}/${{ matrix.image_name }}@sha256:%s ' *)
       -
         name: Inspect image
