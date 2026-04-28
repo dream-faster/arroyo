@@ -102,60 +102,9 @@ jobs:
       - name: Check Formatting
         run: cargo fmt -- --check
 
-  prepare-rust-ci:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.0.6
-          run_install: |
-            - recursive: true
-              args: [--frozen-lockfile, --strict-peer-dependencies]
-      - name: Prepare shared Rust CI assets
-        shell: bash
-        run: |
-          rm -rf .ci-tools
-          mkdir -p .ci-tools/bin .ci-tools/cargo-home/bin
-
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$GITHUB_WORKSPACE/.ci-tools/bin"
-          export CARGO_HOME="$GITHUB_WORKSPACE/.ci-tools/cargo-home"
-          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-          wget -q https://github.com/protocolbuffers/protobuf/releases/download/v21.8/protoc-21.8-linux-x86_64.zip -O /tmp/protoc.zip
-          rm -rf /tmp/protoc
-          unzip -q /tmp/protoc.zip bin/protoc -d /tmp/protoc
-          install /tmp/protoc/bin/protoc "$GITHUB_WORKSPACE/.ci-tools/bin/protoc"
-
-          wget --progress=dot --show-progress https://dlcdn.apache.org/kafka/3.9.2/kafka_2.13-3.9.2.tgz -O /tmp/kafka.tgz
-          tar xzf /tmp/kafka.tgz -C "$GITHUB_WORKSPACE/.ci-tools"
-
-          wget -q https://github.com/rust-db/refinery/releases/download/0.8.7/refinery-0.8.7-x86_64-unknown-linux-musl.tar.gz -O /tmp/refinery.tgz
-          rm -rf /tmp/refinery-unpack
-          mkdir -p /tmp/refinery-unpack
-          tar xzf /tmp/refinery.tgz -C /tmp/refinery-unpack
-          install /tmp/refinery-unpack/refinery-*-musl/refinery "$GITHUB_WORKSPACE/.ci-tools/bin/refinery"
-
-          (
-            cd webui
-            pnpm build
-          )
-
-          tar czf /tmp/rust-ci-prep.tgz .ci-tools webui/dist
-      - name: Upload shared Rust CI assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-ci-prep
-          path: /tmp/rust-ci-prep.tgz
-
   build-rust-workspace:
     needs:
       - changes
-      - prepare-rust-ci
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
@@ -177,7 +126,6 @@ jobs:
   build-rust:
     needs:
       - rust-components
-      - prepare-rust-ci
       - build-rust-workspace
     name: build-rust (${{ matrix.package }})
     runs-on: ubuntu-22.04
@@ -204,7 +152,6 @@ jobs:
   integ-postgres:
     needs:
       - changes
-      - prepare-rust-ci
       - build-rust-workspace
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
@@ -231,7 +178,6 @@ jobs:
   integ-sqlite:
     needs:
       - changes
-      - prepare-rust-ci
       - build-rust-workspace
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
