@@ -132,16 +132,17 @@ runs:
 
         "$REDPANDA_DIR/bin/rpk" redpanda start --config /tmp/redpanda.yaml --mode dev-container >/tmp/redpanda.log 2>&1 &
         timeout=30
-        while ! nc -z localhost 9092 && [ $timeout -gt 0 ]; do
+        while ! "$REDPANDA_DIR/bin/rpk" cluster info --brokers 127.0.0.1:9092 >/tmp/redpanda-cluster-info 2>/tmp/redpanda-cluster-info.err && [ $timeout -gt 0 ]; do
           sleep 1
           timeout=$((timeout - 1))
         done
         if [ $timeout -eq 0 ]; then
           echo "Redpanda failed to start within 30 seconds" >&2
+          cat /tmp/redpanda-cluster-info.err >&2 || true
           cat /tmp/redpanda.log >&2
           exit 1
         fi
-        echo "Redpanda is listening on localhost:9092"
+        echo "Redpanda is ready on localhost:9092"
 
     - name: Setup mosquitto
       shell: bash
