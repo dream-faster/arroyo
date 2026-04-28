@@ -90,7 +90,7 @@ jobs:
         run: cargo build --all-features --package ${{ matrix.package }}
       - name: Run Clippy
         run: cargo clippy --all-features --all-targets --package ${{ matrix.package }} -- -D warnings
-      - name: Test
+      - name: Run lib tests
         run: cargo nextest run --all-features --package ${{ matrix.package }} -E 'kind(lib)' --no-tests pass
 
   integ-postgres:
@@ -105,8 +105,8 @@ jobs:
         run: cargo build --all-features --package arroyo
       - name: Integ postgres
         run: |
-          mkdir -p /tmp/arroyo-integ
           killall arroyo || true
+          mkdir -p /tmp/arroyo-integ
           ARROYO__DISABLE_TELEMETRY=true ARROYO__CHECKPOINT_URL=file:///tmp/arroyo-integ ARROYO__COMPILER__ARTIFACT_URL=file:///tmp/artifacts target/debug/arroyo cluster &
           cargo nextest run --package integ -E 'kind(test)'
 
@@ -122,8 +122,8 @@ jobs:
         run: cargo build --all-features --package arroyo
       - name: Integ sqlite
         run: |
-          mkdir -p /tmp/arroyo-integ
           killall arroyo || true
+          mkdir -p /tmp/arroyo-integ
           ARROYO__DISABLE_TELEMETRY=true ARROYO__CHECKPOINT_URL=file:///tmp/arroyo-integ ARROYO__COMPILER__ARTIFACT_URL=file:///tmp/artifacts ARROYO__DATABASE__TYPE=sqlite target/debug/arroyo cluster &
           timeout=10; while ! nc -z localhost 5115 && [ $timeout -gt 0 ]; do sleep 1; timeout=$((timeout - 1)); done; [ $timeout -gt 0 ]
           cargo nextest run --package integ -E 'kind(test)'
