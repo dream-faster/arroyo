@@ -77,6 +77,9 @@ message JoinOperator {
   ArroyoSchema output_schema = 4;
   bytes join_plan = 5;
   optional uint64 ttl_micros = 6;
+  optional uint32 asof_left_time_index = 7;
+  optional uint32 asof_right_time_index = 8;
+  optional bool asof_left_gte_right = 9;
 }
 
 message LookupJoinCondition {

@@ -1,3 +1,4 @@
+use crate::arrow::asof_join::AsofJoinConstructor;
 use crate::arrow::async_udf::AsyncUdfConstructor;
 use crate::arrow::incremental_aggregator::IncrementalAggregatingConstructor;
 use crate::arrow::instant_join::InstantJoinConstructor;
@@ -895,6 +896,7 @@ pub fn construct_operator(
         OperatorName::UpdatingAggregate => Box::new(IncrementalAggregatingConstructor),
         OperatorName::ExpressionWatermark => Box::new(WatermarkGeneratorConstructor),
         OperatorName::Join => Box::new(JoinWithExpirationConstructor),
+        OperatorName::AsofJoin => Box::new(AsofJoinConstructor),
         OperatorName::InstantJoin => Box::new(InstantJoinConstructor),
         OperatorName::LookupJoin => Box::new(LookupJoinConstructor),
         OperatorName::WindowFunction => Box::new(WindowFunctionConstructor),

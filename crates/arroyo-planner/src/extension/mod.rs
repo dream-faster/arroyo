@@ -21,9 +21,9 @@ use watermark_node::WatermarkNode;
 use self::debezium::{DebeziumUnrollingExtension, ToDebeziumExtension};
 use self::updating_aggregate::UpdatingAggregateExtension;
 use self::{
-    aggregate::AggregateExtension, key_calculation::KeyCalculationExtension,
-    remote_table::RemoteTableExtension, sink::SinkExtension, table_source::TableSourceExtension,
-    window_fn::WindowFunctionExtension,
+    aggregate::AggregateExtension, asof_join::AsofJoinExtension,
+    key_calculation::KeyCalculationExtension, remote_table::RemoteTableExtension,
+    sink::SinkExtension, table_source::TableSourceExtension, window_fn::WindowFunctionExtension,
 };
 use crate::builder::{NamedNode, Planner};
 use crate::extension::lookup::LookupJoin;
@@ -33,6 +33,7 @@ use crate::{ASYNC_RESULT_FIELD, DFField, fields_with_qualifiers, schema_from_df_
 use join::JoinExtension;
 
 pub(crate) mod aggregate;
+pub(crate) mod asof_join;
 pub(crate) mod debezium;
 pub(crate) mod join;
 pub(crate) mod key_calculation;
@@ -85,6 +86,7 @@ impl<'a> TryFrom<&'a dyn UserDefinedLogicalNode> for &'a dyn ArroyoExtension {
             .or_else(|_| try_from_t::<AggregateExtension>(node))
             .or_else(|_| try_from_t::<RemoteTableExtension>(node))
             .or_else(|_| try_from_t::<JoinExtension>(node))
+            .or_else(|_| try_from_t::<AsofJoinExtension>(node))
             .or_else(|_| try_from_t::<WindowFunctionExtension>(node))
             .or_else(|_| try_from_t::<AsyncUDFExtension>(node))
             .or_else(|_| try_from_t::<ToDebeziumExtension>(node))

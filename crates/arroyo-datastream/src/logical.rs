@@ -32,6 +32,7 @@ pub enum OperatorName {
     Projection,
     AsyncUdf,
     Join,
+    AsofJoin,
     InstantJoin,
     LookupJoin,
     WindowFunction,
@@ -406,6 +407,7 @@ impl LogicalProgram {
                     | OperatorName::ArrowKey
                     | OperatorName::Projection => continue,
                     OperatorName::Join => "join-with-expiration".to_string(),
+                    OperatorName::AsofJoin => "asof-join".to_string(),
                     OperatorName::InstantJoin => "windowed-join".to_string(),
                     OperatorName::WindowFunction => "sql-window-function".to_string(),
                     OperatorName::LookupJoin => "lookup-join".to_string(),

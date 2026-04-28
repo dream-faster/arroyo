@@ -1,3 +1,4 @@
+--pk=trade_time,symbol
 CREATE TABLE trades (
   timestamp TIMESTAMP,
   symbol TEXT,
@@ -45,4 +46,5 @@ SELECT
 FROM trades t
 ASOF JOIN quotes q
   MATCH_CONDITION (t.timestamp >= q.timestamp)
-  ON t.symbol = q.symbol;
+  ON t.symbol = q.symbol
+WHERE t.symbol IN ('AAPL', 'MSFT');

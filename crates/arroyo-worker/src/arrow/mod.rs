@@ -32,6 +32,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+pub mod asof_join;
 pub mod async_udf;
 pub mod incremental_aggregator;
 pub mod instant_join;

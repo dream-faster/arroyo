@@ -88,6 +88,8 @@ use unicase::UniCase;
 
 const DEFAULT_IDLE_TIME: Option<Duration> = Some(Duration::from_secs(5 * 60));
 pub const ASYNC_RESULT_FIELD: &str = "__async_result";
+pub const ASOF_JOIN_GTE_FUNCTION: &str = "__arroyo_asof_join_gte";
+pub const ASOF_JOIN_LTE_FUNCTION: &str = "__arroyo_asof_join_lte";
 
 #[derive(Clone, Debug)]
 pub struct CompiledSql {
@@ -269,6 +271,22 @@ impl ArroyoSchemaProvider {
                 vec![],
                 DataType::Timestamp(datatypes::TimeUnit::Nanosecond, None),
             ))
+            .unwrap();
+
+        registry
+            .register_udf(Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
+                name: ASOF_JOIN_GTE_FUNCTION.to_string(),
+                signature: Signature::any(2, Volatility::Volatile),
+                return_type: Arc::new(|_| Ok(DataType::Boolean)),
+            })))
+            .unwrap();
+
+        registry
+            .register_udf(Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
+                name: ASOF_JOIN_LTE_FUNCTION.to_string(),
+                signature: Signature::any(2, Volatility::Volatile),
+                return_type: Arc::new(|_| Ok(DataType::Boolean)),
+            })))
             .unwrap();
 
         register_functions(&mut registry);

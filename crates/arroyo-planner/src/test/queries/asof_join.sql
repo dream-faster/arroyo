@@ -31,4 +31,5 @@ SELECT
 FROM trades t
 ASOF JOIN quotes q
   MATCH_CONDITION (t.timestamp >= q.timestamp)
-  ON t.symbol = q.symbol;
+  ON t.symbol = q.symbol
+WHERE t.symbol IN ('AAPL', 'MSFT');

@@ -1,7 +1,7 @@
 use crate::extension::remote_table::RemoteTableExtension;
 use crate::types::convert_data_type;
 use crate::{
-    ArroyoSchemaProvider, DFField,
+    ASOF_JOIN_GTE_FUNCTION, ASOF_JOIN_LTE_FUNCTION, ArroyoSchemaProvider, DFField,
     external::{ProcessingMode, SqlSource},
     fields_with_qualifiers, multifield_partial_ord, parse_sql,
 };
@@ -59,6 +59,12 @@ use datafusion::{
 use itertools::Itertools;
 use sqlparser::ast;
 use sqlparser::ast::TableConstraint;
+use sqlparser::ast::{
+    BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, Ident, Join as SqlJoin, JoinConstraint as SqlJoinConstraint,
+    JoinOperator as SqlJoinOperator, ObjectName, Query as SqlQuery, Select as SqlSelect,
+    SetExpr as SqlSetExpr, Statement as SqlStatement, TableFactor, TableWithJoins,
+};
 use std::sync::Arc;
 use std::{collections::HashMap, time::Duration};
 use tracing::warn;
@@ -140,9 +146,10 @@ fn produce_optimized_plan(
     statement: &Statement,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<LogicalPlan> {
+    let statement = rewrite_asof_statement(statement)?;
     let sql_to_rel = SqlToRel::new(schema_provider);
 
-    let plan = sql_to_rel.sql_statement_to_plan(statement.clone())?;
+    let plan = sql_to_rel.sql_statement_to_plan(statement)?;
 
     let analyzed_plan = schema_provider.analyzer.execute_and_check(
         plan,
@@ -189,6 +196,141 @@ fn produce_optimized_plan(
         |_plan, _rule| {},
     )?;
     Ok(plan)
+}
+
+fn rewrite_asof_statement(statement: &Statement) -> Result<Statement> {
+    let mut statement = statement.clone();
+    rewrite_asof_sql_statement(&mut statement)?;
+    Ok(statement)
+}
+
+fn rewrite_asof_sql_statement(statement: &mut SqlStatement) -> Result<()> {
+    match statement {
+        SqlStatement::Query(query) => rewrite_asof_query(query),
+        SqlStatement::Insert(insert) => {
+            if let Some(source) = insert.source.as_mut() {
+                rewrite_asof_query(source)
+            } else {
+                Ok(())
+            }
+        }
+        SqlStatement::CreateView { query, .. } => rewrite_asof_query(query),
+        SqlStatement::CreateTable(CreateTable {
+            query: Some(query), ..
+        }) => rewrite_asof_query(query),
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_asof_query(query: &mut SqlQuery) -> Result<()> {
+    if let Some(with) = query.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            rewrite_asof_query(&mut cte.query)?;
+        }
+    }
+
+    rewrite_asof_set_expr(query.body.as_mut())
+}
+
+fn rewrite_asof_set_expr(set_expr: &mut SqlSetExpr) -> Result<()> {
+    match set_expr {
+        SqlSetExpr::Select(select) => rewrite_asof_select(select),
+        SqlSetExpr::Query(query) => rewrite_asof_query(query),
+        SqlSetExpr::SetOperation { left, right, .. } => {
+            rewrite_asof_set_expr(left)?;
+            rewrite_asof_set_expr(right)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_asof_select(select: &mut SqlSelect) -> Result<()> {
+    for from in &mut select.from {
+        rewrite_asof_table_with_joins(from)?;
+    }
+
+    Ok(())
+}
+
+fn rewrite_asof_table_with_joins(table_with_joins: &mut TableWithJoins) -> Result<()> {
+    rewrite_asof_table_factor(&mut table_with_joins.relation)?;
+
+    for join in &mut table_with_joins.joins {
+        rewrite_asof_join(join)?;
+    }
+
+    Ok(())
+}
+
+fn rewrite_asof_table_factor(table_factor: &mut TableFactor) -> Result<()> {
+    match table_factor {
+        TableFactor::Derived { subquery, .. } => rewrite_asof_query(subquery),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => rewrite_asof_table_with_joins(table_with_joins),
+        TableFactor::Pivot { table, .. }
+        | TableFactor::Unpivot { table, .. }
+        | TableFactor::MatchRecognize { table, .. } => rewrite_asof_table_factor(table),
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_asof_join(join: &mut SqlJoin) -> Result<()> {
+    rewrite_asof_table_factor(&mut join.relation)?;
+
+    let SqlJoinOperator::AsOf {
+        match_condition,
+        constraint,
+    } = &join.join_operator
+    else {
+        return Ok(());
+    };
+
+    let SqlExpr::BinaryOp { left, op, right } = match_condition.clone() else {
+        return plan_err!("ASOF MATCH_CONDITION must be a binary comparison");
+    };
+    let function_name = match op {
+        BinaryOperator::GtEq => ASOF_JOIN_GTE_FUNCTION,
+        BinaryOperator::LtEq => ASOF_JOIN_LTE_FUNCTION,
+        _ => {
+            return plan_err!("ASOF MATCH_CONDITION must use >= or <=, found '{}'", op);
+        }
+    };
+
+    let placeholder = SqlExpr::Function(Function {
+        name: ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+            Ident::new(function_name),
+        )]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(*left)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(*right)),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    });
+
+    let new_constraint = match constraint.clone() {
+        SqlJoinConstraint::On(expr) => SqlJoinConstraint::On(SqlExpr::BinaryOp {
+            left: Box::new(expr),
+            op: BinaryOperator::And,
+            right: Box::new(placeholder),
+        }),
+        SqlJoinConstraint::None => SqlJoinConstraint::On(placeholder),
+        SqlJoinConstraint::Using(_) | SqlJoinConstraint::Natural => {
+            return plan_err!("ASOF JOIN currently supports only ON conditions");
+        }
+    };
+
+    join.join_operator = SqlJoinOperator::LeftOuter(new_constraint);
+    Ok(())
 }
 
 impl From<Connection> for ConnectorTable {

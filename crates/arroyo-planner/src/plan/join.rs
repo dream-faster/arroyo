@@ -1,10 +1,14 @@
+use crate::extension::asof_join::AsofJoinExtension;
 use crate::extension::join::JoinExtension;
 use crate::extension::key_calculation::KeyCalculationExtension;
 use crate::extension::lookup::{LookupJoin, LookupSource};
 use crate::plan::WindowDetectingVisitor;
 use crate::schemas::add_timestamp_field;
 use crate::tables::ConnectorTable;
-use crate::{ArroyoSchemaProvider, fields_with_qualifiers, schema_from_df_fields_with_metadata};
+use crate::{
+    ASOF_JOIN_GTE_FUNCTION, ASOF_JOIN_LTE_FUNCTION, ArroyoSchemaProvider, fields_with_qualifiers,
+    schema_from_df_fields_with_metadata,
+};
 use arroyo_datastream::WindowType;
 use arroyo_rpc::UPDATING_META_FIELD;
 use datafusion::common::tree_node::{
@@ -28,6 +32,16 @@ pub(crate) struct JoinRewriter<'a> {
 }
 
 impl JoinRewriter<'_> {
+    fn check_asof_windowing(join: &Join) -> Result<()> {
+        if WindowDetectingVisitor::get_window(&join.left)?.is_some()
+            || WindowDetectingVisitor::get_window(&join.right)?.is_some()
+        {
+            return not_impl_err!("ASOF joins do not support windowed inputs");
+        }
+
+        Ok(())
+    }
+
     fn check_join_windowing(join: &Join) -> Result<bool> {
         let left_window = WindowDetectingVisitor::get_window(&join.left)?;
         let right_window = WindowDetectingVisitor::get_window(&join.right)?;
@@ -196,6 +210,108 @@ impl JoinRewriter<'_> {
             output_schema.clone(),
         )?))
     }
+
+    fn asof_time_indices(
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        filter: &Expr,
+    ) -> Result<Option<(usize, usize, bool)>> {
+        let Expr::ScalarFunction(function) = filter else {
+            return Ok(None);
+        };
+
+        let (left_gte_right, args) = match function.func.name() {
+            ASOF_JOIN_GTE_FUNCTION => (true, &function.args),
+            ASOF_JOIN_LTE_FUNCTION => (false, &function.args),
+            _ => return Ok(None),
+        };
+
+        if args.len() != 2 {
+            return plan_err!("ASOF join placeholder must have exactly two arguments");
+        }
+
+        let left_column = Self::column_from_expr(&args[0])?;
+        let right_column = Self::column_from_expr(&args[1])?;
+
+        Ok(Some((
+            left.schema().index_of_column(left_column)?,
+            right.schema().index_of_column(right_column)?,
+            left_gte_right,
+        )))
+    }
+
+    fn column_from_expr(expr: &Expr) -> Result<&Column> {
+        match expr {
+            Expr::Column(column) => Ok(column),
+            Expr::Alias(alias) => Self::column_from_expr(&alias.expr),
+            Expr::Cast(cast) => Self::column_from_expr(&cast.expr),
+            Expr::TryCast(cast) => Self::column_from_expr(&cast.expr),
+            _ => plan_err!("ASOF join MATCH_CONDITION must compare columns from each input"),
+        }
+    }
+
+    fn maybe_plan_asof_join(&mut self, join: Join) -> Result<Option<LogicalPlan>> {
+        let Some((left_time_index, right_time_index, left_gte_right)) = join
+            .filter
+            .as_ref()
+            .map(|filter| Self::asof_time_indices(&join.left, &join.right, filter))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+
+        Self::check_asof_windowing(&join)?;
+        Self::check_updating(&join.left, &join.right)?;
+
+        let Join {
+            left,
+            right,
+            on,
+            join_constraint: JoinConstraint::On,
+            null_equals_null: false,
+            join_type,
+            ..
+        } = join
+        else {
+            return not_impl_err!("can't handle join constraint other than ON");
+        };
+
+        let (left_expressions, right_expressions): (Vec<_>, Vec<_>) =
+            on.clone().into_iter().unzip();
+
+        let left_input = Self::create_join_key_plan(left, left_expressions, "left")?;
+        let right_input = Self::create_join_key_plan(right, right_expressions, "right")?;
+
+        let rewritten_join = LogicalPlan::Join(Join {
+            schema: Arc::new(build_join_schema(
+                left_input.schema(),
+                right_input.schema(),
+                &join_type,
+            )?),
+            left: Arc::new(left_input.clone()),
+            right: Arc::new(right_input.clone()),
+            on,
+            join_type,
+            join_constraint: JoinConstraint::On,
+            null_equals_null: false,
+            filter: None,
+        });
+
+        let final_logical_plan = self.post_join_timestamp_projection(rewritten_join)?;
+
+        Ok(Some(LogicalPlan::Extension(Extension {
+            node: Arc::new(AsofJoinExtension {
+                left_input,
+                right_input,
+                schema: final_logical_plan.schema().clone(),
+                left_time_index,
+                right_time_index,
+                left_gte_right,
+                ttl: self.schema_provider.planning_options.ttl,
+            }),
+        })))
+    }
 }
 
 #[derive(Default)]
@@ -317,6 +433,10 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         let LogicalPlan::Join(join) = node else {
             return Ok(Transformed::no(node));
         };
+
+        if let Some(plan) = self.maybe_plan_asof_join(join.clone())? {
+            return Ok(Transformed::yes(plan));
+        }
 
         if let Some(plan) = maybe_plan_lookup_join(&join)? {
             return Ok(Transformed::yes(plan));
