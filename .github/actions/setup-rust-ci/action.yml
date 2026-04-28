@@ -73,6 +73,10 @@ runs:
           packages+=(netcat-openbsd)
         fi
         sudo apt-get install -y "${packages[@]}"
+
+    - name: Install cargo-nextest
+      shell: bash
+      run: |
         curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
     - name: Setup Postgres

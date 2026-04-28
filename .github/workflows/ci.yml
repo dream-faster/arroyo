@@ -96,7 +96,7 @@ jobs:
           }
 
           @lru_cache(maxsize=None)
-          def compute_dependency_closure(name):
+          def get_cached_dependency_closure(name):
               return transitive_workspace_dependencies(name, ())
 
           def transitive_workspace_dependencies(name, path):
@@ -112,7 +112,7 @@ jobs:
 
           def depends_on_any_target(package_names, targets):
               return any(
-                  compute_dependency_closure(package_name) & targets
+                  get_cached_dependency_closure(package_name) & targets
                   for package_name in package_names
               )
 
