@@ -131,7 +131,6 @@ runs:
         EOF
 
         "$REDPANDA_DIR/bin/rpk" redpanda start --config /tmp/redpanda.yaml --mode dev-container >/tmp/redpanda.log 2>&1 &
-        echo $! > /tmp/redpanda.pid
         deadline=$((SECONDS + 30))
         until "$REDPANDA_DIR/bin/rpk" cluster info --brokers 127.0.0.1:9092 >/tmp/redpanda-cluster-info 2>/tmp/redpanda-cluster-info.err; do
           if [ $SECONDS -ge $deadline ]; then
