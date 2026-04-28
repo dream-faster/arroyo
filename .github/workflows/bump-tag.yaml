@@ -16,17 +16,17 @@ permissions:
   contents: write
 
 concurrency:
-  group: bump-tag-main
+  group: bump-tag-master
   cancel-in-progress: false
 
 jobs:
   bump-tag:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out main
+      - name: Check out master
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: master
           fetch-depth: 0
 
       - name: Configure git

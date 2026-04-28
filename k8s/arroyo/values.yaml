@@ -6,7 +6,7 @@ clusterDomain: cluster.local
 
 image:
   registry: ghcr.io
-  namespace: dream-faster
+  namespace: arroyosystems
   name: arroyo
   # Override the namespace when installing charts published from another fork or organization.
   # Defaults to the chart appVersion when left empty so chart releases pull the matching image tag.
