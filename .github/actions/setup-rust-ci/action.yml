@@ -44,6 +44,12 @@ runs:
         pnpm install @openapitools/openapi-generator-cli -g
         cd crates/arroyo-openapi && openapi-generator-cli version
 
+    - name: Build console
+      shell: bash
+      run: |
+        cd webui
+        pnpm build
+
     - name: Setup Postgres
       shell: bash
       run: |
