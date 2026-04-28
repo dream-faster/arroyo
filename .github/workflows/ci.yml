@@ -8,7 +8,28 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      webui: ${{ steps.filter.outputs.webui }}
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            webui:
+              - 'webui/**'
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/actions/**'
+
   lint-console:
+    needs: changes
+    if: needs.changes.outputs.webui == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,6 +47,8 @@ jobs:
           pnpm check
 
   rust-components:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     outputs:
       packages: ${{ steps.packages.outputs.packages }}
@@ -60,6 +83,8 @@ jobs:
           echo "packages=$packages" >> "$GITHUB_OUTPUT"
 
   rust-format:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -94,6 +119,8 @@ jobs:
         run: cargo nextest run --all-features --package ${{ matrix.package }} -E 'kind(lib)' --no-tests=pass
 
   integ-postgres:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -111,6 +138,8 @@ jobs:
           cargo nextest run --package integ -E 'kind(test)'
 
   integ-sqlite:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -129,6 +158,8 @@ jobs:
           cargo nextest run --package integ -E 'kind(test)'
 
   build-console:
+    needs: changes
+    if: needs.changes.outputs.webui == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
