@@ -26,6 +26,11 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 use uuid::Uuid;
 pub mod arrow;
+#[cfg(feature = "iceberg")]
+#[path = "iceberg/mod.rs"]
+pub(crate) mod iceberg;
+#[cfg(not(feature = "iceberg"))]
+#[path = "iceberg_disabled.rs"]
 pub(crate) mod iceberg;
 pub mod json;
 pub mod local;
@@ -41,6 +46,7 @@ use self::{
 };
 
 use self::iceberg::metadata::IcebergFileMetadata;
+use self::iceberg::schema::SchemaRef as IcebergSchemaRef;
 use crate::filesystem::config::NamingConfig;
 use crate::filesystem::sink::iceberg::IcebergTable;
 use crate::filesystem::sink::partitioning::{Partitioner, PartitionerMode};
@@ -413,7 +419,7 @@ struct AsyncMultipartFileSystemWriter<BBW: BatchBufferingWriter> {
     file_naming: NamingConfig,
     format: Format,
     schema: ArroyoSchemaRef,
-    iceberg_schema: Option<::iceberg::spec::SchemaRef>,
+    iceberg_schema: Option<IcebergSchemaRef>,
     event_logger: FsEventLogger,
     partitioner: Arc<Partitioner>,
 }
@@ -1481,7 +1487,7 @@ pub trait BatchBufferingWriter: Send {
         config: &config::FileSystemSink,
         format: Format,
         schema: ArroyoSchemaRef,
-        iceberg_schema: Option<::iceberg::spec::SchemaRef>,
+        iceberg_schema: Option<IcebergSchemaRef>,
         event_logger: FsEventLogger,
     ) -> DataflowResult<Self>
     where
@@ -1525,7 +1531,7 @@ impl<BBW: BatchBufferingWriter> BatchMultipartWriter<BBW> {
         config: &config::FileSystemSink,
         format: Format,
         schema: ArroyoSchemaRef,
-        iceberg_schema: Option<::iceberg::spec::SchemaRef>,
+        iceberg_schema: Option<IcebergSchemaRef>,
         event_logger: FsEventLogger,
     ) -> DataflowResult<Self> {
         let batch_buffering_writer = BBW::new(

@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
+iceberg = ["arroyo-connectors/iceberg"]
+kinesis = ["arroyo-connectors/kinesis"]
 
 [dependencies]
 arroyo-types = { path = "../arroyo-types" }

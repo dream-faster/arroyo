@@ -14,7 +14,6 @@ use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Value, ValueWithSpan,
 };
 use datafusion_expr::ExprSchemable;
-use iceberg::spec::{PartitionSpec, SchemaRef};
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -601,6 +600,7 @@ impl Transform {
     }
 }
 
+#[cfg(feature = "iceberg")]
 impl From<Transform> for iceberg::spec::Transform {
     fn from(value: Transform) -> Self {
         use iceberg::spec::Transform as ITransform;
@@ -798,8 +798,12 @@ impl FromOpts for IcebergPartitioning {
 }
 
 impl IcebergPartitioning {
-    pub fn as_partition_spec(&self, schema: SchemaRef) -> Result<PartitionSpec, iceberg::Error> {
-        let mut builder = PartitionSpec::builder(schema.clone());
+    #[cfg(feature = "iceberg")]
+    pub fn as_partition_spec(
+        &self,
+        schema: iceberg::spec::SchemaRef,
+    ) -> Result<iceberg::spec::PartitionSpec, iceberg::Error> {
+        let mut builder = iceberg::spec::PartitionSpec::builder(schema.clone());
 
         for f in &self.fields {
             builder = builder.add_partition_field(&f.field, f.name(), f.transform_fn.into())?;

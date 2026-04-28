@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 profiling = ["tikv-jemallocator/profiling"]
+iceberg = ["arroyo-api/iceberg", "arroyo-planner/iceberg", "arroyo-worker/iceberg"]
+kinesis = ["arroyo-api/kinesis", "arroyo-planner/kinesis", "arroyo-worker/kinesis"]
 
 [dependencies]
 arroyo-types = { path ="../arroyo-types" }

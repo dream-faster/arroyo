@@ -1,4 +1,5 @@
 mod config;
+#[cfg(feature = "iceberg")]
 pub(crate) mod iceberg;
 pub mod sink;
 mod source;

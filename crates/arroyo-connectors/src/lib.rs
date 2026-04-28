@@ -21,6 +21,7 @@ pub mod confluent;
 pub mod filesystem;
 pub mod impulse;
 pub mod kafka;
+#[cfg(feature = "kinesis")]
 pub mod kinesis;
 pub mod mqtt;
 pub mod nats;
@@ -40,9 +41,11 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
         Box::new(blackhole::BlackholeConnector {}),
         Box::new(confluent::ConfluentConnector {}),
         Box::new(filesystem::FileSystemConnector {}),
+        #[cfg(feature = "iceberg")]
         Box::new(filesystem::iceberg::IcebergConnector {}),
         Box::new(impulse::ImpulseConnector {}),
         Box::new(kafka::KafkaConnector {}),
+        #[cfg(feature = "kinesis")]
         Box::new(kinesis::KinesisConnector {}),
         Box::new(mqtt::MqttConnector {}),
         Box::new(nats::NatsConnector {}),
@@ -179,7 +182,11 @@ pub fn render_schema<T: ?Sized + JsonSchema>() -> String {
 
 #[cfg(test)]
 mod test {
+<<<<<<< HEAD
     use super::{connector_for_type, connectors};
+=======
+    use super::connectors;
+>>>>>>> 55e4ec31 (feat: gate iceberg and kinesis connectors by feature)
     use arrow::array::RecordBatch;
     use arroyo_operator::context::Collector;
     use arroyo_rpc::errors::DataflowResult;
@@ -203,5 +210,13 @@ mod test {
     fn fluvio_connector_is_not_registered() {
         assert!(connector_for_type("fluvio").is_none());
         assert!(!connectors().contains_key("fluvio"));
+    }
+
+    #[test]
+    fn optional_connectors_follow_feature_flags() {
+        let connectors = connectors();
+
+        assert_eq!(connectors.contains_key("iceberg"), cfg!(feature = "iceberg"));
+        assert_eq!(connectors.contains_key("kinesis"), cfg!(feature = "kinesis"));
     }
 }
