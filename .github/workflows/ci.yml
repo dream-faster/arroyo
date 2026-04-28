@@ -106,6 +106,7 @@ jobs:
       - name: Integ postgres
         run: |
           mkdir -p /tmp/arroyo-integ
+          killall arroyo || true
           ARROYO__DISABLE_TELEMETRY=true ARROYO__CHECKPOINT_URL=file:///tmp/arroyo-integ ARROYO__COMPILER__ARTIFACT_URL=file:///tmp/artifacts target/debug/arroyo cluster &
           cargo nextest run --package integ -E 'kind(test)'
 
