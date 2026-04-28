@@ -33,9 +33,9 @@ jobs:
 
       - name: Package chart
         run: |
-          helm dependency update /home/runner/work/arroyo/arroyo/k8s/arroyo
+          helm dependency update k8s/arroyo
           mkdir -p /tmp/charts
-          helm package /home/runner/work/arroyo/arroyo/k8s/arroyo --destination /tmp/charts
+          helm package k8s/arroyo --destination /tmp/charts
 
       - name: Push chart
         run: |
