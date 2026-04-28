@@ -91,7 +91,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-features --all-targets --package ${{ matrix.package }} -- -D warnings
       - name: Run lib tests
-        run: cargo nextest run --all-features --package ${{ matrix.package }} -E 'kind(lib)' --no-tests pass
+        run: cargo nextest run --all-features --package ${{ matrix.package }} -E 'kind(lib)' --no-tests=pass
 
   integ-postgres:
     runs-on: ubuntu-22.04
