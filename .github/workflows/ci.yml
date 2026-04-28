@@ -4,11 +4,14 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   lint-console:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -27,7 +30,7 @@ jobs:
     outputs:
       packages: ${{ steps.packages.outputs.packages }}
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -36,13 +39,30 @@ jobs:
       - name: Determine Rust components
         id: packages
         run: |
-          packages=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; data = json.load(sys.stdin); print(json.dumps(sorted(pkg["name"] for pkg in data["packages"] if pkg["name"] != "integ")))')
+          packages=$(python3 <<'PY'
+          import json
+          import subprocess
+
+          data = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          packages = sorted(
+              pkg["name"]
+              for pkg in data["packages"]
+              if pkg["name"] != "integ"
+          )
+          print(json.dumps(packages))
+          PY
+          )
           echo "packages=$packages" >> "$GITHUB_OUTPUT"
 
   rust-format:
     runs-on: ubuntu-22.04
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -60,12 +80,12 @@ jobs:
       fail-fast: false
       matrix:
         package: ${{ fromJson(needs.rust-components.outputs.packages) }}
-    env:
-      DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - uses: ./.github/actions/setup-rust-ci
+        env:
+          DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build
         run: cargo build --all-features --package ${{ matrix.package }}
       - name: Run Clippy
@@ -75,12 +95,12 @@ jobs:
 
   integ-postgres:
     runs-on: ubuntu-22.04
-    env:
-      DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - uses: ./.github/actions/setup-rust-ci
+        env:
+          DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build Arroyo
         run: cargo build --all-features --package arroyo
       - name: Integ postgres
@@ -91,12 +111,12 @@ jobs:
 
   integ-sqlite:
     runs-on: ubuntu-22.04
-    env:
-      DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - uses: ./.github/actions/setup-rust-ci
+        env:
+          DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build Arroyo
         run: cargo build --all-features --package arroyo
       - name: Integ sqlite
@@ -109,7 +129,7 @@ jobs:
   build-console:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out
+      - name: Checkout
         uses: actions/checkout@v3
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
