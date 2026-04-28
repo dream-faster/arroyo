@@ -75,14 +75,19 @@ runs:
         sudo mv bin/protoc /usr/local/bin
         curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-    - name: Install Kafka
+    - name: Install Redpanda
       shell: bash
       run: |
-        wget --progress=dot --show-progress https://dlcdn.apache.org/kafka/3.9.2/kafka_2.13-3.9.2.tgz
-        tar xvfz kafka*.tgz
-        mkdir -p /tmp/kraft-combined-logs
-        kafka_*/bin/kafka-storage.sh format -t 9v5PspiySuWU2l5NjTgRuA -c kafka_*/config/kraft/server.properties
-        kafka_*/bin/kafka-server-start.sh -daemon kafka_*/config/kraft/server.properties
+        docker run -d --name redpanda --network=host redpandadata/redpanda:v25.1.6 redpanda start \
+          --mode dev-container \
+          --smp 1 \
+          --memory 1G \
+          --reserve-memory 0M \
+          --overprovisioned \
+          --check=false \
+          --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+          --advertise-kafka-addr PLAINTEXT://127.0.0.1:9092
+        timeout=30; while ! nc -z localhost 9092 && [ $timeout -gt 0 ]; do sleep 1; timeout=$((timeout - 1)); done; [ $timeout -gt 0 ]
 
     - name: Install mosquitto
       shell: bash
