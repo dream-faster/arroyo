@@ -60,7 +60,11 @@ Container image tag defaults to the chart appVersion when not explicitly overrid
 Container image reference.
 */}}
 {{- define "arroyo.image" -}}
+{{- if .Values.image.namespace -}}
 {{- printf "%s/%s/%s:%s" .Values.image.registry .Values.image.namespace .Values.image.name (include "arroyo.imageTag" .) -}}
+{{- else -}}
+{{- printf "%s/%s:%s" .Values.image.registry .Values.image.name (include "arroyo.imageTag" .) -}}
+{{- end -}}
 {{- end }}
 
 {{/*
