@@ -515,7 +515,9 @@ impl FunctionRegistry for ArroyoSchemaProvider {
     }
 
     fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> Result<Option<Arc<ScalarUDF>>> {
-        let replaced = self.functions.insert(udf.name().to_string(), Arc::clone(&udf));
+        let replaced = self
+            .functions
+            .insert(udf.name().to_string(), Arc::clone(&udf));
 
         for alias in udf.aliases() {
             self.functions.insert(alias.to_string(), Arc::clone(&udf));
