@@ -19,7 +19,6 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum_extra::extract::WithRejection;
 use std::str::FromStr;
-use std::sync::Arc;
 use tonic::transport::Channel;
 use tracing::error;
 

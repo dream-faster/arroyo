@@ -383,7 +383,6 @@ impl ArroyoSchemaProvider {
 
         Ok(parsed.udf.name)
     }
-
 }
 
 fn create_table(table_name: String, schema: Arc<Schema>) -> Arc<dyn TableSource> {

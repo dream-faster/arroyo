@@ -146,7 +146,13 @@ fn ${functionName}(x: i64) -> i64 {
     // Tip: rename the function to something descriptive
 }`;
 
-    const newUdf = { name: functionName, definition: defaultRust, id, language: 'rust', open: true };
+    const newUdf: LocalUdf = {
+      name: functionName,
+      definition: defaultRust,
+      id,
+      language: 'rust',
+      open: true,
+    };
     const newLocalUdfs = [...localUdfs, newUdf];
     setLocalUdfs(newLocalUdfs);
     setSelectedUdfId(id);
