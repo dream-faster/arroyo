@@ -924,7 +924,7 @@ export interface components {
             language?: components["schemas"]["UdfLanguage"];
         };
         /** @enum {string} */
-        UdfLanguage: "python" | "rust";
+        UdfLanguage: "rust";
         UdfPost: {
             definition: string;
             description?: string | null;
