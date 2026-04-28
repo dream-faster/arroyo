@@ -74,7 +74,10 @@ runs:
         REDPANDA_DIR=/tmp/redpanda-${REDPANDA_VERSION}
         echo "REDPANDA_DIR=$REDPANDA_DIR" >> "$GITHUB_ENV"
         rm -rf "$REDPANDA_DIR"
-        wget --progress=dot --show-progress https://vectorized-public.s3.us-west-2.amazonaws.com/releases/redpanda/${REDPANDA_VERSION}/redpanda-${REDPANDA_VERSION}-amd64.tar.gz -O /tmp/redpanda.tgz
+        wget --progress=dot --show-progress https://vectorized-public.s3.us-west-2.amazonaws.com/releases/redpanda/${REDPANDA_VERSION}/redpanda-${REDPANDA_VERSION}-amd64.tar.gz -O /tmp/redpanda.tgz || {
+          echo "Failed to download Redpanda ${REDPANDA_VERSION}" >&2
+          exit 1
+        }
         tar xzf /tmp/redpanda.tgz -C /tmp
 
     - name: Setup Postgres
