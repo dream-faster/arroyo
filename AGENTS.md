@@ -20,9 +20,3 @@ Run the same categories of checks that CI enforces before committing.
 | Static checks | `cd webui && pnpm check` |
 | Tests | `cargo nextest run -E 'kind(lib)' --all-features` |
 
-## Notes
-
-- Run the web console checks from `webui/`.
-- `pnpm check` is the console static-check entry point and covers Prettier plus ESLint.
-- `pnpm build` compiles the console with `tsc` and then builds it with Vite.
-- Keep the final verification scoped to the code you changed, but do not commit until the required checks above pass.
