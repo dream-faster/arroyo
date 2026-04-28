@@ -138,6 +138,7 @@ runs:
           cat /tmp/redpanda.log >&2
           exit 1
         fi
+        echo "Redpanda is listening on localhost:9092"
 
     - name: Setup mosquitto
       shell: bash
