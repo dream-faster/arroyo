@@ -50,6 +50,20 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{/*
+Container image tag defaults to the chart appVersion when not explicitly overridden.
+*/}}
+{{- define "arroyo.imageTag" -}}
+{{- default .Chart.AppVersion .Values.image.tag -}}
+{{- end }}
+
+{{/*
+Container image reference.
+*/}}
+{{- define "arroyo.image" -}}
+{{- printf "%s:%s" .Values.image.repository (include "arroyo.imageTag" .) -}}
+{{- end }}
+
+{{/*
 Common labels
 */}}
 {{- define "arroyo.labels" -}}
