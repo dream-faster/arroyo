@@ -154,8 +154,6 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         env:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
-      - name: Build
-        run: cargo build --all-features ${{ matrix.package.package_args }}
       - name: Run Clippy
         run: cargo clippy --all-features --all-targets ${{ matrix.package.package_args }} -- -D warnings
       - name: Run lib tests
