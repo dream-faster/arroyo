@@ -206,17 +206,6 @@ impl NatsSourceFunc {
                 replay_policy,
                 ack_wait,
                 description,
-                filter_subjects,
-                rate_limit,
-                sample_frequency,
-                num_replicas,
-                inactive_threshold,
-                max_ack_pending,
-                max_deliver,
-                max_waiting,
-                max_batch,
-                max_bytes,
-                max_expires,
                 ..
             } => consumer::pull::Config {
                 name: Some(consumer_name.clone()),
@@ -231,17 +220,6 @@ impl NatsSourceFunc {
                 },
                 ack_wait: Duration::from_secs(*ack_wait as u64),
                 description: description.clone(),
-                filter_subjects: filter_subjects.clone(),
-                rate_limit: *rate_limit as u64,
-                sample_frequency: *sample_frequency as u8,
-                num_replicas: *num_replicas as usize,
-                inactive_threshold: Duration::from_secs(*inactive_threshold as u64),
-                max_ack_pending: *max_ack_pending,
-                max_deliver: *max_deliver,
-                max_waiting: *max_waiting,
-                max_batch: *max_batch,
-                max_bytes: *max_bytes,
-                max_expires: Duration::from_secs(*max_expires as u64),
                 deliver_policy,
                 ..Default::default()
             },
@@ -366,7 +344,7 @@ impl NatsSourceFunc {
                                     let message_info = msg.info().expect("Couldn't get message information");
                                     let timestamp = message_info.published.into() ;
                                     if flatbuffers {
-                                        for batch in decode_flatbuffers_message(payload)
+                                        for batch in decode_flatbuffers_message(payload, timestamp)
                                             .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
                                         {
                                             collector.collect(batch).await?;
@@ -490,7 +468,7 @@ impl NatsSourceFunc {
                                     let payload = msg.payload.as_ref();
                                     let timestamp = SystemTime::now();
                                     if flatbuffers {
-                                        for batch in decode_flatbuffers_message(payload)
+                                        for batch in decode_flatbuffers_message(payload, timestamp)
                                             .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
                                         {
                                             collector.collect(batch).await?;

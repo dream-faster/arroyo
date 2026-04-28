@@ -19,9 +19,12 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::num::NonZeroU32;
+use std::time::SystemTime;
 use tokio::sync::mpsc::Sender;
 use typify::import_types;
 
+mod live_ingestion_flatbuffers;
+mod live_ingestion_marketdata_generated;
 pub mod sink;
 pub mod source;
 
@@ -389,7 +392,13 @@ pub(crate) fn encode_flatbuffers_message(batch: &RecordBatch) -> anyhow::Result<
     Ok(bytes.into_inner())
 }
 
-pub(crate) fn decode_flatbuffers_message(msg: &[u8]) -> anyhow::Result<Vec<RecordBatch>> {
+pub(crate) fn decode_flatbuffers_message(
+    msg: &[u8],
+    timestamp: SystemTime,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    if let Some(batch) = live_ingestion_flatbuffers::decode_message(msg, timestamp)? {
+        return Ok(vec![batch]);
+    }
     let reader = StreamReader::try_new(Cursor::new(msg), None)?;
     reader.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }

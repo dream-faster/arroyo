@@ -37,6 +37,7 @@ regress = "0.10.0"
 futures = "0.3.28"
 rand = { workspace = true }
 bytes = "1.11.1"
+flatbuffers = "25.2.10"
 url = "2.5.0"
 itertools = "0.14.0"
 regex = "1"
