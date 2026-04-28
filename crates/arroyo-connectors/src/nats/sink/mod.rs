@@ -16,7 +16,7 @@ mod test;
 
 pub enum NatsSinkEncoder {
     Flatbuffers,
-    Serializer(ArrowSerializer),
+    Serializer(Box<ArrowSerializer>),
 }
 
 pub struct NatsSinkFunc {

@@ -357,9 +357,9 @@ impl Connector for NatsConnector {
                     publisher: None,
                     encoder: match &format {
                         Format::Flatbuffers(_) => NatsSinkEncoder::Flatbuffers,
-                        _ => NatsSinkEncoder::Serializer(
+                        _ => NatsSinkEncoder::Serializer(Box::new(
                             arroyo_formats::ser::ArrowSerializer::new(format.clone()),
-                        ),
+                        )),
                     },
                 }))
             }

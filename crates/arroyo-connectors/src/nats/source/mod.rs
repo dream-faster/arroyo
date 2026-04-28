@@ -367,7 +367,7 @@ impl NatsSourceFunc {
                                     let timestamp = message_info.published.into() ;
                                     if flatbuffers {
                                         for batch in decode_flatbuffers_message(payload)
-                                            .map_err(|e| connector_err!(External, WithBackoff, source: e.into(), "failed to decode NATS flatbuffers payload"))?
+                                            .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
                                         {
                                             collector.collect(batch).await?;
                                         }
@@ -491,7 +491,7 @@ impl NatsSourceFunc {
                                     let timestamp = SystemTime::now();
                                     if flatbuffers {
                                         for batch in decode_flatbuffers_message(payload)
-                                            .map_err(|e| connector_err!(External, WithBackoff, source: e.into(), "failed to decode NATS flatbuffers payload"))?
+                                            .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
                                         {
                                             collector.collect(batch).await?;
                                         }
