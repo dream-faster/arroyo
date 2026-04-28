@@ -76,15 +76,51 @@ jobs:
                   text=True,
               )
           )
-          packages = sorted(
-              pkg["name"]
-              for pkg in data["packages"]
-              if pkg["name"] != "integ"
-          )
-          print(json.dumps(packages))
-          PY
-          )
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+           packages = sorted(
+               pkg["name"]
+               for pkg in data["packages"]
+               if pkg["name"] != "integ"
+           )
+           bundled_packages = [
+               ("fast-foundation", [
+                   "arroyo-metrics",
+                   "arroyo-types",
+                   "arroyo-udf-common",
+                   "arroyo-udf-macros",
+               ]),
+               ("fast-runtime", [
+                   "arroyo-compiler-service",
+                   "arroyo-rpc",
+                   "arroyo-state",
+                   "arroyo-storage",
+                   "arroyo-udf-host",
+               ]),
+           ]
+           grouped = []
+           assigned = set()
+           for name, group_packages in bundled_packages:
+               present = [pkg for pkg in group_packages if pkg in packages]
+               if not present:
+                   continue
+               grouped.append(
+                   {
+                       "name": name,
+                       "package_args": " ".join(f"--package {pkg}" for pkg in present),
+                   }
+               )
+               assigned.update(present)
+           grouped.extend(
+               {
+                   "name": pkg,
+                   "package_args": f"--package {pkg}",
+               }
+               for pkg in packages
+               if pkg not in assigned
+           )
+           print(json.dumps(grouped))
+           PY
+           )
+           echo "packages=$packages" >> "$GITHUB_OUTPUT"
 
   rust-format:
     needs: changes
@@ -103,7 +139,7 @@ jobs:
 
   build-rust:
     needs: rust-components
-    name: build-rust (${{ matrix.package }})
+    name: build-rust (${{ matrix.package.name }})
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -116,11 +152,11 @@ jobs:
         env:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build
-        run: cargo build --all-features --package ${{ matrix.package }}
+        run: cargo build --all-features ${{ matrix.package.package_args }}
       - name: Run Clippy
-        run: cargo clippy --all-features --all-targets --package ${{ matrix.package }} -- -D warnings
+        run: cargo clippy --all-features --all-targets ${{ matrix.package.package_args }} -- -D warnings
       - name: Run lib tests
-        run: cargo nextest run --all-features --package ${{ matrix.package }} -E 'kind(lib)' --no-tests=pass
+        run: cargo nextest run --all-features ${{ matrix.package.package_args }} -E 'kind(lib)' --no-tests=pass
 
   integ-postgres:
     needs: changes
