@@ -166,13 +166,12 @@ jobs:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build workspace
         run: cargo build --all-features --workspace
-      - name: Archive workspace build
-        run: tar czf /tmp/rust-target.tgz target
       - name: Upload workspace build
         uses: actions/upload-artifact@v4
         with:
           name: rust-target
-          path: /tmp/rust-target.tgz
+          path: target
+          compression-level: 0
           if-no-files-found: error
 
   build-rust:
@@ -196,9 +195,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rust-target
-          path: /tmp/rust-target
-      - name: Extract workspace build
-        run: tar xzf /tmp/rust-target/rust-target.tgz -C "$GITHUB_WORKSPACE"
+          path: "$GITHUB_WORKSPACE"
       - name: Run Clippy
         run: cargo clippy --all-features --all-targets --package ${{ matrix.package }} -- -D warnings
       - name: Run lib tests
@@ -221,11 +218,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rust-target
-          path: /tmp/rust-target
-      - name: Extract workspace build
-        run: |
-          tar xzf /tmp/rust-target/rust-target.tgz -C "$GITHUB_WORKSPACE"
-          chmod +x target/debug/arroyo
+          path: "$GITHUB_WORKSPACE"
+      - name: Restore Arroyo execute bit
+        run: chmod +x target/debug/arroyo
       - name: Integ postgres
         run: |
           killall arroyo || true
@@ -250,11 +245,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rust-target
-          path: /tmp/rust-target
-      - name: Extract workspace build
-        run: |
-          tar xzf /tmp/rust-target/rust-target.tgz -C "$GITHUB_WORKSPACE"
-          chmod +x target/debug/arroyo
+          path: "$GITHUB_WORKSPACE"
+      - name: Restore Arroyo execute bit
+        run: chmod +x target/debug/arroyo
       - name: Integ sqlite
         run: |
           killall arroyo || true
