@@ -96,13 +96,13 @@ jobs:
           }
 
           @lru_cache(maxsize=None)
-          def closure(name):
+          def compute_dependency_closure(name):
               return transitive_workspace_dependencies(name, ())
 
           def transitive_workspace_dependencies(name, path):
               if name in path:
                   cycle = " -> ".join((*path, name))
-                  raise ValueError(f"cycle detected in workspace dependency graph: {cycle}")
+                  raise ValueError(f"Cycle detected in workspace dependency graph: {cycle}")
 
               deps = {name}
               next_path = (*path, name)
@@ -112,7 +112,7 @@ jobs:
 
           def depends_on_any_target(package_names, targets):
               return any(
-                  closure(package_name) & targets
+                  compute_dependency_closure(package_name) & targets
                   for package_name in package_names
               )
 

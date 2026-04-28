@@ -58,7 +58,7 @@ runs:
         cd webui
         pnpm build
 
-    - name: Install base dependencies and optional services
+    - name: Install dependencies based on inputs
       shell: bash
       run: |
         sudo apt-get update
