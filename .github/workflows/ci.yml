@@ -143,7 +143,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rust-target
-          path: "$GITHUB_WORKSPACE/target"
+          path: target
       - name: Run Clippy
         run: cargo clippy --all-features --all-targets --package ${{ matrix.package }} -- -D warnings
       - name: Run lib tests
@@ -165,7 +165,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rust-target
-          path: "$GITHUB_WORKSPACE/target"
+          path: target
       - name: Restore Arroyo execute bit
         run: chmod +x target/debug/arroyo
       - name: Integ postgres
@@ -191,7 +191,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rust-target
-          path: "$GITHUB_WORKSPACE/target"
+          path: target
       - name: Restore Arroyo execute bit
         run: chmod +x target/debug/arroyo
       - name: Integ sqlite
