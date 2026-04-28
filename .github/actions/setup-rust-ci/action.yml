@@ -58,7 +58,9 @@ runs:
         sudo systemctl start postgresql
         sudo -u postgres psql -c "CREATE USER arroyo WITH PASSWORD 'arroyo' SUPERUSER;"
         sudo -u postgres createdb arroyo
-        cargo install refinery_cli --version 0.8.14
+        if ! cargo install --list | grep -q '^refinery_cli v0\.8\.14:'; then
+          cargo install refinery_cli --version 0.8.14 --force
+        fi
         ~/.cargo/bin/refinery migrate -e DATABASE_URL -p crates/arroyo-api/migrations
 
     - name: Install dependencies
