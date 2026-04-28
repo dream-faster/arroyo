@@ -412,7 +412,7 @@ fn datepart_to_months(year: i32, month: i32) -> i32 {
     12 * (year - YEARS_BEFORE_UNIX_EPOCH) + month
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "iceberg"))]
 mod tests {
 
     use super::*;

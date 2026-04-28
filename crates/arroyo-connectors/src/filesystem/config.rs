@@ -538,6 +538,7 @@ pub enum IcebergCatalog {
 }
 
 /// Main Iceberg profile (wraps the catalog).
+#[cfg_attr(not(feature = "iceberg"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct IcebergProfile {
@@ -932,6 +933,7 @@ impl FromOpts for IcebergSink {
 }
 
 /// Wrapper allowing future extension of Iceberg table types.
+#[cfg_attr(not(feature = "iceberg"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IcebergTable {

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod metadata {
     use anyhow::anyhow;
     use arroyo_rpc::errors::{DataflowError, DataflowResult, ErrorDomain, RetryHint};
@@ -23,6 +25,15 @@ pub mod metadata {
         pub row_count: u64,
         pub split_offsets: Vec<i64>,
         pub columns: HashMap<i32, ColumnAccum>,
+    }
+
+    impl IcebergFileMetadata {
+        pub fn from_parquet<T>(
+            _: T,
+            _: &crate::filesystem::sink::iceberg::schema::SchemaRef,
+        ) -> Self {
+            Self::default()
+        }
     }
 
     pub fn iceberg_disabled_error() -> DataflowError {
@@ -67,6 +78,7 @@ pub mod schema {
     }
 }
 
+#[allow(dead_code)]
 #[path = "iceberg/transforms.rs"]
 pub mod transforms;
 

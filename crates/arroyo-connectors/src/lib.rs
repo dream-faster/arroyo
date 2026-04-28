@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail};
 use arroyo_operator::connector::ErasedConnector;
 use arroyo_rpc::api_types::connections::{
-    ConnectionSchema, ConnectionType, FieldType, SourceField, TestSourceMessage,
+    ConnectionType, FieldType, SourceField, TestSourceMessage,
 };
 use arroyo_rpc::var_str::VarStr;
 use arroyo_types::string_to_map;
@@ -216,7 +216,13 @@ mod test {
     fn optional_connectors_follow_feature_flags() {
         let connectors = connectors();
 
-        assert_eq!(connectors.contains_key("iceberg"), cfg!(feature = "iceberg"));
-        assert_eq!(connectors.contains_key("kinesis"), cfg!(feature = "kinesis"));
+        assert_eq!(
+            connectors.contains_key("iceberg"),
+            cfg!(feature = "iceberg")
+        );
+        assert_eq!(
+            connectors.contains_key("kinesis"),
+            cfg!(feature = "kinesis")
+        );
     }
 }

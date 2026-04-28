@@ -5,8 +5,7 @@ use super::{
 use crate::filesystem::config;
 use crate::filesystem::sink::iceberg::metadata::IcebergFileMetadata;
 use crate::filesystem::sink::iceberg::schema::{
-    SchemaRef as IcebergSchemaRef,
-    normalize_batch_to_schema, update_field_ids_to_iceberg,
+    SchemaRef as IcebergSchemaRef, normalize_batch_to_schema, update_field_ids_to_iceberg,
 };
 use anyhow::Result;
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
