@@ -182,6 +182,7 @@ pub fn render_schema<T: ?Sized + JsonSchema>() -> String {
 
 #[cfg(test)]
 mod test {
+    use super::{connector_for_type, connectors};
     use arrow::array::RecordBatch;
     use arroyo_operator::context::Collector;
     use arroyo_rpc::errors::DataflowResult;
@@ -199,5 +200,11 @@ mod test {
         async fn broadcast_watermark(&mut self, _: Watermark) -> DataflowResult<()> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn fluvio_connector_is_not_registered() {
+        assert!(connector_for_type("fluvio").is_none());
+        assert!(!connectors().contains_key("fluvio"));
     }
 }
