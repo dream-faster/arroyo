@@ -250,7 +250,7 @@ impl<V: LocalWriter + Send + 'static> TwoPhaseCommitter for LocalFileSystemWrite
         self.finished_files = recovered_files;
         self.next_file_index = max_file_index;
 
-        let storage_provider = StorageProvider::for_url(&self.final_dir)
+        StorageProvider::for_url(&self.final_dir)
             .await
             .map_err(|e| {
                 connector_err!(
