@@ -70,9 +70,11 @@ runs:
         mkdir -p /tmp/refinery-unpack
         tar xzf /tmp/refinery.tgz -C /tmp/refinery-unpack
         install /tmp/refinery-unpack/refinery-*-musl/refinery /tmp/refinery
-        rm -rf /tmp/kafka_2.13-3.9.2
-        wget --progress=dot --show-progress https://dlcdn.apache.org/kafka/3.9.2/kafka_2.13-3.9.2.tgz -O /tmp/kafka.tgz
-        tar xzf /tmp/kafka.tgz -C /tmp
+        echo "REDPANDA_VERSION=25.2.7" >> "$GITHUB_ENV"
+        echo "REDPANDA_DIR=/tmp/redpanda-25.2.7" >> "$GITHUB_ENV"
+        rm -rf /tmp/redpanda-25.2.7
+        wget --progress=dot --show-progress https://vectorized-public.s3.us-west-2.amazonaws.com/releases/redpanda/25.2.7/redpanda-25.2.7-amd64.tar.gz -O /tmp/redpanda.tgz
+        tar xzf /tmp/redpanda.tgz -C /tmp
 
     - name: Setup Postgres
       shell: bash
@@ -82,12 +84,55 @@ runs:
         sudo -u postgres createdb arroyo
         /tmp/refinery migrate -e DATABASE_URL -p crates/arroyo-api/migrations
 
-    - name: Setup Kafka
+    - name: Setup Redpanda
       shell: bash
       run: |
-        mkdir -p /tmp/kraft-combined-logs
-        /tmp/kafka_2.13-3.9.2/bin/kafka-storage.sh format -t 9v5PspiySuWU2l5NjTgRuA -c /tmp/kafka_2.13-3.9.2/config/kraft/server.properties
-        /tmp/kafka_2.13-3.9.2/bin/kafka-server-start.sh -daemon /tmp/kafka_2.13-3.9.2/config/kraft/server.properties
+        mkdir -p /tmp/redpanda-data
+        cat <<'EOF' > /tmp/redpanda.yaml
+        redpanda:
+          data_directory: "/tmp/redpanda-data"
+          seed_servers: []
+          rpc_server:
+            address: "0.0.0.0"
+            port: 33145
+          advertised_rpc_api:
+            address: "127.0.0.1"
+            port: 33145
+          kafka_api:
+            - address: "0.0.0.0"
+              port: 9092
+          advertised_kafka_api:
+            - address: "127.0.0.1"
+              port: 9092
+          admin:
+            address: "0.0.0.0"
+            port: 9644
+          developer_mode: true
+
+        pandaproxy: {}
+        schema_registry: {}
+
+        rpk:
+          tune_network: false
+          tune_disk_scheduler: false
+          tune_disk_nomerges: false
+          tune_disk_irq: false
+          tune_cpu: false
+          tune_aio_events: false
+          tune_clocksource: false
+          tune_swappiness: false
+          enable_memory_locking: false
+          tune_coredump: false
+          coredump_dir: "/tmp/redpanda-coredump"
+        EOF
+
+        "$REDPANDA_DIR/bin/rpk" redpanda start --config /tmp/redpanda.yaml --mode dev-container >/tmp/redpanda.log 2>&1 &
+        timeout=30
+        while ! nc -z localhost 9092 && [ $timeout -gt 0 ]; do
+          sleep 1
+          timeout=$((timeout - 1))
+        done
+        [ $timeout -gt 0 ]
 
     - name: Setup mosquitto
       shell: bash
