@@ -64,7 +64,7 @@ prost-reflect = "0.14.0"
 prost-build = {version = "0.13" }
 prost-types = "0.13"
 aws-config = "1.5.13"
-reqwest = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 rusqlite = "0.31"
 apache-avro = "0.18.0"
 k8s-openapi = "0.24.0"

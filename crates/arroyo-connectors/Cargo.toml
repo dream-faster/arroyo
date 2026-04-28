@@ -57,7 +57,7 @@ rdkafka = { version = "0.37", features = [
     "cmake-build",
     "tracing",
     "sasl",
-    "ssl-vendored",
+    "ssl",
     "zstd",
 ] }
 sasl2-sys = { version = "0.1.22", features = ["vendored"] }
@@ -66,7 +66,7 @@ sasl2-sys = { version = "0.1.22", features = ["vendored"] }
 eventsource-client = "0.13.0"
 
 # Websocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # Webhook
 reqwest = { workspace = true, features = ["stream"] }
@@ -83,7 +83,7 @@ redis = { version = "0.28", features = [
 ] }
 
 # Fluvio
-fluvio = { version = "0.24", features = ["openssl"] }
+fluvio = { version = "0.24", default-features = false, features = ["rustls", "compress"] }
 
 # Kinesis
 aws-sdk-kinesis = { version = "1.95" }
