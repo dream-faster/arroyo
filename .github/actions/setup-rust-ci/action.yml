@@ -58,11 +58,11 @@ runs:
         cd webui
         pnpm build
 
-    - name: Install dependencies
+    - name: Install base dependencies and optional services
       shell: bash
       run: |
         sudo apt-get update
-        packages=(cmake clang ruby unzip protobuf-compiler libsasl2-dev)
+        packages=(cmake clang protobuf-compiler libsasl2-dev)
         if [ "${{ inputs.setup-postgres }}" = "true" ]; then
           packages+=(postgresql)
         fi

@@ -97,21 +97,32 @@ jobs:
 
           @lru_cache(maxsize=None)
           def closure(name):
+              return transitive_workspace_dependencies(name, ())
+
+          def transitive_workspace_dependencies(name, path):
+              if name in path:
+                  cycle = " -> ".join((*path, name))
+                  raise ValueError(f"cycle detected in workspace dependency graph: {cycle}")
+
               deps = {name}
+              next_path = (*path, name)
               for dep in dependency_graph.get(name, []):
-                  deps.update(closure(dep))
+                  deps.update(transitive_workspace_dependencies(dep, next_path))
               return frozenset(deps)
 
-          def needs_any(package_names, targets):
-              return any(closure(package_name) & targets for package_name in package_names)
+          def depends_on_any_target(package_names, targets):
+              return any(
+                  closure(package_name) & targets
+                  for package_name in package_names
+              )
 
           def package_entry(name, package_names):
               package_set = set(package_names)
               return {
                   "name": name,
                   "package_args": " ".join(f"--package {pkg}" for pkg in package_names),
-                  "build_console": needs_any(package_names, {"arroyo-api"}),
-                  "setup_postgres": needs_any(
+                  "build_console": depends_on_any_target(package_names, {"arroyo-api"}),
+                  "setup_postgres": depends_on_any_target(
                       package_names,
                       {"arroyo-api", "arroyo-controller"},
                   ),
