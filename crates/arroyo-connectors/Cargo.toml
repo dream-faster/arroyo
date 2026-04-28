@@ -8,6 +8,7 @@ to_string_trait_impl = "allow"
 
 [features]
 default = []
+kafka = ["dep:aws-msk-iam-sasl-signer", "dep:rdkafka", "dep:sasl2-sys"]
 kinesis = ["dep:aws-sdk-kinesis"]
 iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest"]
 
@@ -54,15 +55,15 @@ sha2 = "0.10"
 ##########################
 
 # Kafka
-aws-msk-iam-sasl-signer = "1.0.0"
-rdkafka = { version = "0.37", features = [
+aws-msk-iam-sasl-signer = { version = "1.0.0", optional = true }
+rdkafka = { version = "0.37", optional = true, features = [
     "cmake-build",
     "tracing",
     "sasl",
     "ssl-vendored",
     "zstd",
 ] }
-sasl2-sys = { version = "0.1.22", features = ["vendored"] }
+sasl2-sys = { version = "0.1.22", optional = true, features = ["vendored"] }
 
 # SSE
 eventsource-client = "0.13.0"
