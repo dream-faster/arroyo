@@ -152,6 +152,27 @@ jobs:
           name: rust-ci-prep
           path: /tmp/rust-ci-prep.tgz
 
+  build-integ-arroyo:
+    needs:
+      - changes
+      - prepare-rust-ci
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - uses: ./.github/actions/setup-rust-ci
+        env:
+          DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
+      - name: Build Arroyo
+        run: cargo build --all-features --package arroyo
+      - name: Upload Arroyo binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: arroyo-debug-binary
+          path: target/debug/arroyo
+          if-no-files-found: error
+
   build-rust:
     needs:
       - rust-components
@@ -179,6 +200,7 @@ jobs:
     needs:
       - changes
       - prepare-rust-ci
+      - build-integ-arroyo
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
@@ -187,8 +209,13 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         env:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
-      - name: Build Arroyo
-        run: cargo build --all-features --package arroyo
+      - name: Download Arroyo binary
+        uses: actions/download-artifact@v4
+        with:
+          name: arroyo-debug-binary
+          path: target/debug
+      - name: Restore Arroyo execute bit
+        run: chmod +x target/debug/arroyo
       - name: Integ postgres
         run: |
           killall arroyo || true
@@ -200,6 +227,7 @@ jobs:
     needs:
       - changes
       - prepare-rust-ci
+      - build-integ-arroyo
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     steps:
@@ -208,8 +236,13 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         env:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
-      - name: Build Arroyo
-        run: cargo build --all-features --package arroyo
+      - name: Download Arroyo binary
+        uses: actions/download-artifact@v4
+        with:
+          name: arroyo-debug-binary
+          path: target/debug
+      - name: Restore Arroyo execute bit
+        run: chmod +x target/debug/arroyo
       - name: Integ sqlite
         run: |
           killall arroyo || true
