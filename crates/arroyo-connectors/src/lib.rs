@@ -216,9 +216,18 @@ mod test {
     fn optional_connectors_follow_feature_flags() {
         let connectors = connectors();
 
-        assert_eq!(connectors.contains_key("confluent"), cfg!(feature = "kafka"));
+        assert_eq!(
+            connectors.contains_key("confluent"),
+            cfg!(feature = "kafka")
+        );
         assert_eq!(connectors.contains_key("kafka"), cfg!(feature = "kafka"));
-        assert_eq!(connectors.contains_key("iceberg"), cfg!(feature = "iceberg"));
-        assert_eq!(connectors.contains_key("kinesis"), cfg!(feature = "kinesis"));
+        assert_eq!(
+            connectors.contains_key("iceberg"),
+            cfg!(feature = "iceberg")
+        );
+        assert_eq!(
+            connectors.contains_key("kinesis"),
+            cfg!(feature = "kinesis")
+        );
     }
 }
