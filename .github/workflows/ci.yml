@@ -222,7 +222,7 @@ jobs:
         env:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build Arroyo
-        run: cargo build --package arroyo --all-features
+        run: cargo build --package arroyo
       - name: Integ postgres
         run: |
           killall arroyo || true
@@ -251,7 +251,7 @@ jobs:
         env:
           DATABASE_URL: "postgres://arroyo:arroyo@localhost:5432/arroyo"
       - name: Build Arroyo
-        run: cargo build --package arroyo --all-features
+        run: cargo build --package arroyo
       - name: Integ sqlite
         run: |
           killall arroyo || true

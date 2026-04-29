@@ -53,17 +53,11 @@ use arroyo_types::to_millis;
 use cornucopia_async::{Database, DatabaseSource};
 use petgraph::prelude::EdgeRef;
 
-#[cfg(feature = "kafka")]
 use arrow_schema::SchemaRef;
-#[cfg(feature = "kafka")]
 use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
-#[cfg(feature = "kafka")]
 use arroyo_formats::ser::ArrowSerializer;
-#[cfg(feature = "kafka")]
 use arroyo_rpc::OperatorConfig;
-#[cfg(feature = "kafka")]
 use arroyo_rpc::formats::Format;
-#[cfg(feature = "kafka")]
 use arroyo_rpc::schema_resolver::{ConfluentSchemaRegistry, ConfluentSchemaType};
 
 async fn compile_sql(
@@ -178,8 +172,6 @@ fn set_parallelism(program: &mut LogicalProgram, parallelism: usize) {
     }
 }
 
-#[allow(unused)]
-#[cfg(feature = "kafka")]
 async fn try_register_confluent_schema(
     sink: &mut ConnectorOp,
     schema: &SchemaRef,
@@ -238,14 +230,6 @@ async fn try_register_confluent_schema(
 
     sink.config = serde_json::to_string(&config).unwrap();
 
-    Ok(())
-}
-
-#[cfg(not(feature = "kafka"))]
-async fn try_register_confluent_schema(
-    _sink: &mut ConnectorOp,
-    _schema: &arrow_schema::SchemaRef,
-) -> anyhow::Result<()> {
     Ok(())
 }
 

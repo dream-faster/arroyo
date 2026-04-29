@@ -13,11 +13,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 pub mod blackhole;
-#[cfg(feature = "kafka")]
 pub mod confluent;
 pub mod filesystem;
 pub mod impulse;
-#[cfg(feature = "kafka")]
 pub mod kafka;
 #[cfg(feature = "kinesis")]
 pub mod kinesis;
@@ -37,13 +35,11 @@ pub mod websocket;
 pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
     let connectors: Vec<Box<dyn ErasedConnector>> = vec![
         Box::new(blackhole::BlackholeConnector {}),
-        #[cfg(feature = "kafka")]
         Box::new(confluent::ConfluentConnector {}),
         Box::new(filesystem::FileSystemConnector {}),
         #[cfg(feature = "iceberg")]
         Box::new(filesystem::iceberg::IcebergConnector {}),
         Box::new(impulse::ImpulseConnector {}),
-        #[cfg(feature = "kafka")]
         Box::new(kafka::KafkaConnector {}),
         #[cfg(feature = "kinesis")]
         Box::new(kinesis::KinesisConnector {}),
@@ -67,7 +63,6 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
 #[derive(Serialize, Deserialize)]
 pub struct EmptyConfig {}
 
-#[cfg(feature = "kafka")]
 pub(crate) async fn send(
     tx: &mut tokio::sync::mpsc::Sender<arroyo_rpc::api_types::connections::TestSourceMessage>,
     message: arroyo_rpc::api_types::connections::TestSourceMessage,
@@ -214,11 +209,8 @@ mod test {
     fn optional_connectors_follow_feature_flags() {
         let connectors = connectors();
 
-        assert_eq!(
-            connectors.contains_key("confluent"),
-            cfg!(feature = "kafka")
-        );
-        assert_eq!(connectors.contains_key("kafka"), cfg!(feature = "kafka"));
+        assert!(connectors.contains_key("confluent"));
+        assert!(connectors.contains_key("kafka"));
         assert_eq!(
             connectors.contains_key("iceberg"),
             cfg!(feature = "iceberg")

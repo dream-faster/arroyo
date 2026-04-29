@@ -5,7 +5,6 @@ edition = "2024"
 
 [features]
 default = []
-kafka = ["arroyo-connectors/kafka"]
 iceberg = ["arroyo-connectors/iceberg"]
 kinesis = ["arroyo-connectors/kinesis"]
 
