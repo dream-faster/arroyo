@@ -13,32 +13,32 @@ use arroyo_rpc::grpc::{api, rpc::TableConfig};
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, Watermark, from_nanos, print_time, to_nanos};
 use datafusion::common::ScalarValue;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::{execution::context::SessionContext, physical_plan::ExecutionPlan};
+use datafusion_proto::physical_plan::AsExecutionPlan;
+use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::protobuf::PhysicalExprNode;
-use datafusion_proto::{
-    physical_plan::from_proto::parse_physical_expr,
-};
-use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
 use duckdb::Connection;
+use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
+use futures::StreamExt;
 use prost::Message;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use tracing::warn;
 
+use arroyo_planner::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
 use arroyo_rpc::df::ArroyoSchema;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
+use datafusion_proto::protobuf::PhysicalPlanNode;
 
 /// Per-bin accumulated state: just the raw input `RecordBatch`es that arrived during the window.
+#[derive(Default)]
 struct BinHolder {
     batches: Vec<RecordBatch>,
-}
-
-impl Default for BinHolder {
-    fn default() -> Self {
-        Self { batches: Vec::new() }
-    }
+    checkpointed_len: usize,
 }
 
 /// A tumbling window operator that accumulates raw input batches per window bin and, when the
@@ -55,6 +55,8 @@ pub struct DuckdbTumblingWindowFunc {
     output_schema: SchemaRef,
     /// Input schema (without `_timestamp`).
     input_schema: ArroyoSchema,
+    final_projection: Option<Arc<dyn ExecutionPlan>>,
+    final_batches_passer: Arc<RwLock<Vec<RecordBatch>>>,
     execs: BTreeMap<SystemTime, BinHolder>,
 }
 
@@ -161,8 +163,27 @@ impl OperatorConstructor for DuckdbTumblingWindowConstructor {
         // Build the output schema: all columns from the SQL result plus `_timestamp`.
         // We derive the result schema by running a dry-run of the DuckDB query against an
         // empty table built from the input schema.
-        let result_schema = derive_result_schema(&input_schema.schema, &config.sql_query, &config.input_table_name)?;
+        let result_schema = derive_result_schema(
+            &input_schema.schema,
+            &config.sql_query,
+            &config.input_table_name,
+        )?;
         let output_schema = add_timestamp_field_arrow((*result_schema).clone());
+        let final_batches_passer = Arc::new(RwLock::new(Vec::new()));
+        let final_projection = config
+            .final_projection
+            .map(|proto| PhysicalPlanNode::decode(&mut proto.as_slice()))
+            .transpose()?
+            .map(|plan| {
+                plan.try_into_physical_plan(
+                    registry.as_ref(),
+                    &RuntimeEnvBuilder::new().build().unwrap(),
+                    &ArroyoPhysicalExtensionCodec {
+                        context: DecodingContext::LockedBatchVec(final_batches_passer.clone()),
+                    },
+                )
+            })
+            .transpose()?;
 
         let input_table_name = if config.input_table_name.is_empty() {
             "input".to_string()
@@ -178,6 +199,8 @@ impl OperatorConstructor for DuckdbTumblingWindowConstructor {
                 input_table_name,
                 output_schema,
                 input_schema,
+                final_projection,
+                final_batches_passer,
                 execs: BTreeMap::new(),
             },
         )))
@@ -247,7 +270,10 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
         for (timestamp, batch_list) in table.all_batches_for_watermark(watermark) {
             let bin = self.bin_start(*timestamp);
             let holder = self.execs.entry(bin).or_default();
-            batch_list.iter().for_each(|b| holder.batches.push(b.clone()));
+            batch_list
+                .iter()
+                .for_each(|b| holder.batches.push(b.clone()));
+            holder.checkpointed_len = holder.batches.len();
         }
         Ok(())
     }
@@ -258,6 +284,14 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        let batch = self
+            .input_schema
+            .filter_by_time(batch, ctx.last_present_watermark())
+            .map_err(anyhow::Error::from)?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
         let bin_column = self
             .binning_function
             .evaluate(&batch)?
@@ -266,7 +300,11 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
         let indices = sort_to_indices(bin_column.as_ref(), None, None)?;
         let sorted_batch = RecordBatch::try_new(
             batch.schema(),
-            batch.columns().iter().map(|c| take(c, &indices, None).unwrap()).collect(),
+            batch
+                .columns()
+                .iter()
+                .map(|c| take(c, &indices, None).unwrap())
+                .collect(),
         )?;
         let sorted_bins = take(&*bin_column, &indices, None)?;
 
@@ -292,7 +330,11 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
             }
 
             let bin_batch = sorted_batch.slice(range.start, range.end - range.start);
-            self.execs.entry(bin_start).or_default().batches.push(bin_batch);
+            self.execs
+                .entry(bin_start)
+                .or_default()
+                .batches
+                .push(bin_batch);
         }
         Ok(())
     }
@@ -310,11 +352,27 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
                     break;
                 }
                 let (bin_start, holder) = self.execs.pop_first().unwrap();
-                let results = self
-                    .execute_on_batches(&holder.batches, bin_start)
-                    .map_err(anyhow::Error::from)?;
-                for batch in results {
-                    collector.collect(batch).await?;
+                let results = self.execute_on_batches(&holder.batches, bin_start)?;
+                if let Some(final_projection) = self.final_projection.as_ref() {
+                    if results.is_empty() {
+                        continue;
+                    }
+
+                    {
+                        let mut batches = self.final_batches_passer.write().unwrap();
+                        *batches = results;
+                    }
+
+                    final_projection.reset()?;
+                    let mut projection_exec =
+                        final_projection.execute(0, SessionContext::new().task_ctx())?;
+                    while let Some(batch) = projection_exec.next().await {
+                        collector.collect(batch?).await?;
+                    }
+                } else {
+                    for batch in results {
+                        collector.collect(batch).await?;
+                    }
                 }
             }
         }
@@ -327,12 +385,10 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        let watermark = ctx
-            .watermark()
-            .and_then(|wm| match wm {
-                Watermark::EventTime(t) => Some(t),
-                Watermark::Idle => None,
-            });
+        let watermark = ctx.watermark().and_then(|wm| match wm {
+            Watermark::EventTime(t) => Some(t),
+            Watermark::Idle => None,
+        });
 
         let table = ctx
             .table_manager
@@ -340,15 +396,12 @@ impl ArrowOperator for DuckdbTumblingWindowFunc {
             .await?;
 
         for (bin, holder) in &self.execs {
-            for batch in &holder.batches {
-                let state_batch = append_timestamp(
-                    batch,
-                    &ScalarValue::TimestampNanosecond(Some(to_nanos(*bin) as i64), None),
-                    add_timestamp_field_arrow((*batch.schema()).clone()),
-                )
-                .map_err(anyhow::Error::from)?;
-                table.insert(*bin, state_batch);
+            for batch in &holder.batches[holder.checkpointed_len..] {
+                table.insert(*bin, batch.clone());
             }
+        }
+        for holder in self.execs.values_mut() {
+            holder.checkpointed_len = holder.batches.len();
         }
         table.flush(watermark).await?;
         Ok(())
@@ -405,12 +458,12 @@ mod tests {
     ) -> DuckdbTumblingWindowFunc {
         let width = Duration::from_secs(width_secs);
         // derive output schema
-        let result_schema =
-            derive_result_schema(&input_schema, sql_query, "events").unwrap();
+        let result_schema = derive_result_schema(&input_schema, sql_query, "events").unwrap();
         let output_schema = add_timestamp_field_arrow((*result_schema).clone());
 
         // ArroyoSchema requires a _timestamp field; add one to the schema for tests.
-        let schema_with_ts = Arc::new((*add_timestamp_field_arrow((*input_schema).clone())).clone());
+        let schema_with_ts =
+            Arc::new((*add_timestamp_field_arrow((*input_schema).clone())).clone());
         let ts_index = schema_with_ts.fields().len() - 1;
         let arroyo_schema = ArroyoSchema::new_keyed(schema_with_ts, ts_index, vec![]);
 
@@ -425,6 +478,8 @@ mod tests {
             input_table_name: "events".to_string(),
             output_schema,
             input_schema: arroyo_schema,
+            final_projection: None,
+            final_batches_passer: Arc::new(RwLock::new(Vec::new())),
             execs: BTreeMap::new(),
         }
     }
@@ -479,7 +534,10 @@ mod tests {
         // Strip the _timestamp column for display
         let stripped: Vec<RecordBatch> = results
             .iter()
-            .map(|b| b.project(&(0..b.num_columns() - 1).collect::<Vec<_>>()).unwrap())
+            .map(|b| {
+                b.project(&(0..b.num_columns() - 1).collect::<Vec<_>>())
+                    .unwrap()
+            })
             .collect();
 
         let formatted = pretty_format_batches(&stripped).unwrap().to_string();
@@ -549,11 +607,7 @@ mod tests {
     fn bin_start_rounds_down_to_window_boundary() {
         let wf = {
             let schema = build_events_schema();
-            build_window_func(
-                3600,
-                "SELECT COUNT(*) AS n FROM events",
-                schema,
-            )
+            build_window_func(3600, "SELECT COUNT(*) AS n FROM events", schema)
         };
 
         // 1.5 hours since epoch → should round down to 1 hour since epoch
@@ -595,7 +649,10 @@ mod tests {
 
         let stripped: Vec<RecordBatch> = results
             .iter()
-            .map(|b| b.project(&(0..b.num_columns() - 1).collect::<Vec<_>>()).unwrap())
+            .map(|b| {
+                b.project(&(0..b.num_columns() - 1).collect::<Vec<_>>())
+                    .unwrap()
+            })
             .collect();
 
         let formatted = pretty_format_batches(&stripped).unwrap().to_string();
@@ -631,7 +688,10 @@ mod tests {
         let results = wf.execute_on_batches(&batches, UNIX_EPOCH).unwrap();
         let stripped: Vec<RecordBatch> = results
             .iter()
-            .map(|b| b.project(&(0..b.num_columns() - 1).collect::<Vec<_>>()).unwrap())
+            .map(|b| {
+                b.project(&(0..b.num_columns() - 1).collect::<Vec<_>>())
+                    .unwrap()
+            })
             .collect();
 
         let formatted = pretty_format_batches(&stripped).unwrap().to_string();
@@ -652,21 +712,14 @@ mod tests {
         // Directly test that process_batch routes batches into the right BinHolder bins.
         // We bypass the full operator machinery and just call bin_start.
         let schema = build_events_schema();
-        let wf = build_window_func(
-            3600,
-            "SELECT COUNT(*) AS n FROM events",
-            schema.clone(),
-        );
+        let wf = build_window_func(3600, "SELECT COUNT(*) AS n FROM events", schema.clone());
 
-        let t_bin0 = ts_ns(0);      // maps to bin 0s
-        let t_bin1 = ts_ns(3601);   // maps to bin 3600s
-        let t_bin1b = ts_ns(7100);  // also maps to bin 3600s
+        let t_bin0 = ts_ns(0); // maps to bin 0s
+        let t_bin1 = ts_ns(3601); // maps to bin 3600s
+        let t_bin1b = ts_ns(7100); // also maps to bin 3600s
 
         // bin_start checks
-        assert_eq!(
-            wf.bin_start(from_nanos(t_bin0 as u128)),
-            UNIX_EPOCH
-        );
+        assert_eq!(wf.bin_start(from_nanos(t_bin0 as u128)), UNIX_EPOCH);
         assert_eq!(
             wf.bin_start(from_nanos(t_bin1 as u128)),
             UNIX_EPOCH + Duration::from_secs(3600)

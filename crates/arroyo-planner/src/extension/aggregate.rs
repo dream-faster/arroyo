@@ -297,6 +297,11 @@ impl AggregateExtension {
         width: Duration,
     ) -> Result<LogicalNode> {
         let binning_function_proto = planner.binning_function_proto(width, input_schema.clone())?;
+        let final_physical_plan = planner.sync_plan(&self.final_calculation)?;
+        let final_physical_plan_node = PhysicalPlanNode::try_from_physical_plan(
+            final_physical_plan,
+            &ArroyoPhysicalExtensionCodec::default(),
+        )?;
 
         let sql_query = self.generate_duckdb_sql("input")?;
 
@@ -313,6 +318,7 @@ impl AggregateExtension {
             ),
             sql_query,
             input_table_name: "input".to_string(),
+            final_projection: Some(final_physical_plan_node.encode_to_vec()),
         };
 
         Ok(LogicalNode::single(
@@ -353,15 +359,15 @@ impl AggregateExtension {
             let sql_expr = expr_to_sql(aggr_expr)
                 .map(|e| e.to_string())
                 .unwrap_or_else(|_| format!("{aggr_expr}"));
-            select_parts.push(format!(
-                "{sql_expr} AS {}",
-                quote_duckdb_ident(output_name)
-            ));
+            select_parts.push(format!("{sql_expr} AS {}", quote_duckdb_ident(output_name)));
         }
 
         let table_ref = quote_duckdb_ident(input_table_name);
         if key_count == 0 {
-            Ok(format!("SELECT {} FROM {table_ref}", select_parts.join(", ")))
+            Ok(format!(
+                "SELECT {} FROM {table_ref}",
+                select_parts.join(", ")
+            ))
         } else {
             let group_by: Vec<String> = (0..key_count)
                 .map(|i| quote_duckdb_ident(schema_fields[i].name()))

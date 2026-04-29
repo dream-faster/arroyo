@@ -54,6 +54,7 @@ message DuckdbTumblingWindowAggregateOperator {
   ArroyoSchema input_schema = 4;
   string sql_query = 5;
   string input_table_name = 6;
+  optional bytes final_projection = 7;
 }
 
 message SlidingWindowAggregateOperator {
