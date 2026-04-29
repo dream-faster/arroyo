@@ -115,7 +115,17 @@ pub(crate) async fn create_topic(
         .context("failed to create Kafka controller client")?
         .create_topic(topic.to_string(), partitions, 1, TOPIC_ADMIN_TIMEOUT_MS)
         .await
-        .map_err(|e| anyhow!("failed to create Kafka topic '{topic}': {e}"))
+        .map_err(|e| anyhow!("failed to create Kafka topic '{topic}': {e}"))?;
+
+    for _ in 0..50 {
+        if topic_metadata(client, topic).await?.is_some() {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("Kafka topic '{topic}' was created but did not become visible in metadata")
 }
 
 #[cfg(test)]

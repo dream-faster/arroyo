@@ -440,6 +440,22 @@ async fn create_topic(client: &rskafka::client::Client, topic: &str) {
         .create_topic(topic.to_string(), 1, 1, 5_000)
         .await
         .expect("creation should have worked");
+
+    for _ in 0..50 {
+        if client
+            .list_topics()
+            .await
+            .expect("metadata lookup should succeed")
+            .into_iter()
+            .any(|listed| listed.name == topic)
+        {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("topic {topic} did not become visible after creation");
 }
 
 async fn delete_topic(client: &rskafka::client::Client, topic: &str) {
