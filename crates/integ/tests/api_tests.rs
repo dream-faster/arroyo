@@ -10,8 +10,7 @@ use arroyo_openapi::types::{
     ValidateUdfPost, builder,
 };
 use rand::random;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic};
-use rdkafka::{ClientConfig, ClientContext};
+use rskafka::client::ClientBuilder;
 use serde_json::json;
 use tracing::info;
 
@@ -427,30 +426,27 @@ select my_double(cast(counter as bigint)) from impulse;
         .unwrap();
 }
 
-fn create_kafka_admin() -> AdminClient<impl ClientContext> {
-    ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .create()
+async fn create_kafka_admin() -> rskafka::client::Client {
+    ClientBuilder::new(vec!["localhost:9092".to_string()])
+        .build()
+        .await
         .unwrap()
 }
 
-async fn create_topic(client: &AdminClient<impl ClientContext>, topic: &str) {
+async fn create_topic(client: &rskafka::client::Client, topic: &str) {
     client
-        .create_topics(
-            [&NewTopic::new(
-                topic,
-                1,
-                rdkafka::admin::TopicReplication::Fixed(1),
-            )],
-            &AdminOptions::new(),
-        )
+        .controller_client()
+        .unwrap()
+        .create_topic(topic.to_string(), 1, 1, 5_000)
         .await
-        .expect("deletion should have worked");
+        .expect("creation should have worked");
 }
 
-async fn delete_topic(client: &AdminClient<impl ClientContext>, topic: &str) {
+async fn delete_topic(client: &rskafka::client::Client, topic: &str) {
     client
-        .delete_topics(&[topic], &AdminOptions::new())
+        .controller_client()
+        .unwrap()
+        .delete_topic(topic.to_string(), 5_000)
         .await
         .expect("deletion should have worked");
 }
@@ -470,7 +466,7 @@ async fn connection_table() {
 
     let run_id: u32 = random();
     let table_name = format!("kafka_table_{run_id}");
-    let kafka_admin = create_kafka_admin();
+    let kafka_admin = create_kafka_admin().await;
 
     let kafka_topic = format!("kafka_test_{run_id}");
     create_topic(&kafka_admin, &kafka_topic).await;

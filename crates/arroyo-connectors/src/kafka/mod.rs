@@ -11,29 +11,18 @@ use arroyo_rpc::schema_resolver::{
 };
 use arroyo_rpc::{ConnectorOptions, OperatorConfig, schema_resolver, var_str::VarStr};
 use arroyo_types::string_to_map;
-use aws_config::Region;
-use aws_msk_iam_sasl_signer::generate_auth_token;
-use futures::TryFutureExt;
-use rdkafka::{
-    ClientConfig, ClientContext, Message, Offset, TopicPartitionList,
-    client::OAuthToken,
-    consumer::{Consumer, ConsumerContext},
-    producer::ProducerContext,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Receiver;
-use tokio::time::timeout;
 use tonic::Status;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use typify::import_types;
 
 use crate::{ConnectionType, send};
@@ -43,8 +32,14 @@ use crate::kafka::source::KafkaSourceFunc;
 use arroyo_operator::connector::Connector;
 use arroyo_operator::operator::ConstructedOperator;
 
+mod client_utils;
 mod sink;
 mod source;
+
+use client_utils::{
+    build_client, fetch_topics as fetch_topics_with_client, partition_client,
+    spawn_partition_consumers, start_offset, topic_metadata as fetch_topic_metadata,
+};
 
 const CONFIG_SCHEMA: &str = include_str!("./profile.json");
 const TABLE_SCHEMA: &str = include_str!("./table.json");
@@ -380,11 +375,12 @@ impl Connector for KafkaConnector {
                 read_mode,
                 group_id_prefix,
             } => {
-                let mut client_configs = client_configs(&profile, Some(table.clone()))?;
-                if let Some(ReadMode::ReadCommitted) = read_mode {
-                    client_configs
-                        .insert("isolation.level".to_string(), "read_committed".to_string());
+                if matches!(read_mode, Some(ReadMode::ReadCommitted)) {
+                    bail!(
+                        "Kafka sources configured with source.read_mode='read_committed' are not supported by the rskafka client"
+                    );
                 }
+                let client_configs = client_configs(&profile, Some(table.clone()))?;
 
                 let schema_resolver: Option<Arc<dyn SchemaResolver + Sync>> =
                     if let Some(SchemaRegistry::ConfluentSchemaRegistry {
@@ -434,24 +430,31 @@ impl Connector for KafkaConnector {
                 commit_mode,
                 key_field,
                 timestamp_field,
-            } => Ok(ConstructedOperator::from_operator(Box::new(
-                KafkaSinkFunc {
-                    bootstrap_servers: profile.bootstrap_servers.to_string(),
-                    producer: None,
-                    consistency_mode: (*commit_mode).into(),
-                    timestamp_field: timestamp_field.clone(),
-                    timestamp_col: None,
-                    key_field: key_field.clone(),
-                    key_col: None,
-                    write_futures: vec![],
-                    client_config: client_configs(&profile, Some(table.clone()))?,
-                    context: Context::new(Some(profile.clone())),
-                    topic: table.topic,
-                    serializer: ArrowSerializer::new(
-                        config.format.expect("Format must be defined for KafkaSink"),
-                    ),
-                },
-            ))),
+            } => {
+                if matches!(commit_mode, SinkCommitMode::ExactlyOnce) {
+                    bail!(
+                        "Kafka sinks configured with sink.commit_mode='exactly_once' are not supported by the rskafka client"
+                    );
+                }
+
+                Ok(ConstructedOperator::from_operator(Box::new(
+                    KafkaSinkFunc {
+                        bootstrap_servers: profile.bootstrap_servers.to_string(),
+                        producer: None,
+                        consistency_mode: (*commit_mode).into(),
+                        timestamp_field: timestamp_field.clone(),
+                        timestamp_col: None,
+                        key_field: key_field.clone(),
+                        key_col: None,
+                        client_config: client_configs(&profile, Some(table.clone()))?,
+                        context: Context::new(Some(profile.clone())),
+                        topic: table.topic,
+                        serializer: ArrowSerializer::new(
+                            config.format.expect("Format must be defined for KafkaSink"),
+                        ),
+                    },
+                )))
+            }
         }
     }
 }
@@ -465,59 +468,14 @@ pub struct TopicMetadata {
 }
 
 impl KafkaTester {
-    async fn connect(&self, table: Option<KafkaTable>) -> Result<BaseConsumer, String> {
-        let mut client_config = ClientConfig::new();
-        client_config
-            .set(
-                "bootstrap.servers",
-                self.connection.bootstrap_servers.to_string(),
-            )
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .set(
-                "group.id",
-                match &table {
-                    Some(KafkaTable {
-                        type_:
-                            TableType::Source {
-                                group_id_prefix: Some(prefix),
-                                ..
-                            },
-                        ..
-                    }) => {
-                        format!("{prefix}-arroyo-kafka-tester")
-                    }
-                    _ => "arroyo-kafka-tester".to_string(),
-                },
-            );
-
-        for (k, v) in client_configs(&self.connection, table)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-        {
-            client_config.set(k, v);
-        }
-
-        let context = Context::new(Some(self.connection.clone()));
-        let client: BaseConsumer = client_config
-            .create_with_context(context)
-            .map_err(|e| format!("invalid kafka config: {e:?}"))?;
-
-        // NOTE: this is required to trigger an oauth token refresh (when using
-        // OAUTHBEARER auth).
-        if client.poll(Duration::from_secs(0)).is_some() {
-            return Err("unexpected poll event from new consumer".to_string());
-        }
-
-        tokio::task::spawn_blocking(move || {
-            client
-                .fetch_metadata(None, Duration::from_secs(10))
-                .map_err(|e| format!("Failed to connect to Kafka: {e:?}"))?;
-
-            Ok(client)
-        })
+    async fn connect(&self, table: Option<KafkaTable>) -> Result<rskafka::client::Client, String> {
+        build_client(
+            &self.connection.bootstrap_servers.to_string(),
+            &client_configs(&self.connection, table).map_err(|e| e.to_string())?,
+            &Context::new(Some(self.connection.clone())),
+        )
         .await
-        .map_err(|_| "unexpected error while connecting to kafka")?
+        .map_err(|e| e.to_string())
     }
 
     #[allow(unused)]
@@ -527,56 +485,19 @@ impl KafkaTester {
             .connect(None)
             .await
             .map_err(Status::failed_precondition)?;
+        let metadata = fetch_topic_metadata(&client, topic)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("Topic does not exist"))?;
 
-        let topic = topic.to_string();
-        tokio::task::spawn_blocking(move || {
-            let metadata = client
-                .fetch_metadata(Some(&topic), Duration::from_secs(5))
-                .map_err(|e| {
-                    Status::failed_precondition(format!(
-                        "Failed to read topic metadata from Kafka: {e:?}"
-                    ))
-                })?;
-
-            let topic_metadata = metadata.topics().iter().next().ok_or_else(|| {
-                Status::failed_precondition("Metadata response from broker did not include topic")
-            })?;
-
-            if let Some(e) = topic_metadata.error() {
-                let err = match e {
-                    rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED => {
-                        "Not authorized to access topic".to_string()
-                    }
-                    rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART => {
-                        "Topic does not exist".to_string()
-                    }
-                    _ => format!("Error while fetching topic metadata: {e:?}"),
-                };
-                return Err(Status::failed_precondition(err));
-            }
-
-            Ok(TopicMetadata {
-                partitions: topic_metadata.partitions().len(),
-            })
-        }).map_err(|_| Status::internal("unexpected error while fetching topic metadata")).await?
+        Ok(TopicMetadata {
+            partitions: metadata.partitions.len(),
+        })
     }
 
     async fn fetch_topics(&self) -> anyhow::Result<Vec<(String, usize)>> {
-        let client = self.connect(None).await.map_err(|e| anyhow!("{}", e))?;
-
-        tokio::task::spawn_blocking(move || {
-            let metadata = client
-                .fetch_metadata(None, Duration::from_secs(5))
-                .map_err(|e| anyhow!("Failed to read topic metadata from Kafka: {:?}", e))?;
-
-            Ok(metadata
-                .topics()
-                .iter()
-                .map(|t| (t.name().to_string(), t.partitions().len()))
-                .collect())
-        })
-        .await
-        .map_err(|_| anyhow!("unexpected error while fetching topic metadata"))?
+        let client = self.connect(None).await.map_err(|e| anyhow!("{e}"))?;
+        fetch_topics_with_client(&client).await
     }
 
     pub async fn test_schema_registry(&self) -> anyhow::Result<()> {
@@ -772,86 +693,53 @@ impl KafkaTester {
         self.info(&mut tx, "Connected to Kafka").await;
 
         let topic = table.topic.clone();
-
-        let metadata = client
-            .fetch_metadata(Some(&topic), Duration::from_secs(10))
-            .map_err(|e| anyhow!("Failed to fetch metadata: {:?}", e))?;
-
-        self.info(&mut tx, "Fetched topic metadata").await;
-
-        {
-            let topic_metadata = metadata.topics().first().ok_or_else(|| {
+        let metadata = fetch_topic_metadata(&client, &topic)
+            .await?
+            .ok_or_else(|| {
                 anyhow!(
-                    "Returned metadata was empty; unable to subscribe to topic '{}'",
+                    "Topic '{}' does not exist in the configured Kafka cluster",
                     topic
                 )
             })?;
 
-            if let Some(err) = topic_metadata.error() {
-                match err {
-                    rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR__UNKNOWN_PARTITION
-                    | rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR__UNKNOWN_TOPIC
-                    | rdkafka::types::RDKafkaRespErr::RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART => {
-                        bail!(
-                            "Topic '{}' does not exist in the configured Kafka cluster",
-                            topic
-                        );
-                    }
-                    e => {
-                        error!("Unhandled Kafka error while fetching metadata: {:?}", e);
-                        bail!(
-                            "Something went wrong while fetching topic metadata: {:?}",
-                            e
-                        );
-                    }
-                }
-            }
-
-            let map = topic_metadata
-                .partitions()
-                .iter()
-                .map(|p| ((topic.clone(), p.id()), Offset::Beginning))
-                .collect();
-
-            client
-                .assign(&TopicPartitionList::from_topic_map(&map).unwrap())
-                .map_err(|e| anyhow!("Failed to subscribe to topic '{}': {:?}", topic, e))?;
-        }
+        self.info(&mut tx, "Fetched topic metadata").await;
 
         if let TableType::Source { .. } = table.type_ {
             self.info(&mut tx, "Waiting for messages").await;
 
+            let mut consumers = Vec::with_capacity(metadata.partitions.len());
+            for partition in &metadata.partitions {
+                consumers.push((
+                    *partition,
+                    partition_client(&client, &topic, *partition).await?,
+                    start_offset(SourceOffset::Earliest, None)?,
+                ));
+            }
+            let (mut rx, handles) = spawn_partition_consumers(&topic, consumers);
             let start = Instant::now();
             let timeout = Duration::from_secs(30);
             while start.elapsed() < timeout {
-                match client.poll(Duration::ZERO) {
-                    Some(Ok(message)) => {
+                if let Ok(Some(message)) =
+                    tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+                {
+                    let message = message?;
+                    if let Some(payload) = message.record.record.value {
                         self.info(&mut tx, "Received message from Kafka").await;
-                        self.validate_schema(
-                            &table,
-                            schema.as_ref().unwrap(),
-                            &format,
-                            message
-                                .detach()
-                                .payload()
-                                .ok_or_else(|| anyhow!("received message with empty payload"))?
-                                .to_vec(),
-                        )
-                        .await?;
+                        self.validate_schema(&table, schema.as_ref().unwrap(), &format, payload)
+                            .await?;
 
                         self.info(&mut tx, "Successfully validated message schema")
                             .await;
+                        for handle in handles {
+                            handle.abort();
+                        }
                         return Ok(());
                     }
-                    Some(Err(e)) => {
-                        warn!("Error while reading from kafka in test: {:?}", e);
-                        return Err(anyhow!("Error while reading messages from Kafka: {}", e));
-                    }
-                    None => {
-                        // wait
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
                 }
+            }
+
+            for handle in handles {
+                handle.abort();
             }
 
             return Err(anyhow!(
@@ -924,16 +812,6 @@ impl KafkaTester {
     }
 }
 
-impl SourceOffset {
-    fn get_offset(&self) -> Offset {
-        match self {
-            SourceOffset::Earliest => Offset::Beginning,
-            SourceOffset::Latest => Offset::End,
-            SourceOffset::Group => Offset::Stored,
-        }
-    }
-}
-
 pub fn client_configs(
     connection: &KafkaConfig,
     table: Option<KafkaTable>,
@@ -967,7 +845,7 @@ pub fn client_configs(
         for (k, v) in table.client_configs.iter() {
             if connection.connection_properties.contains_key(k) {
                 warn!(
-                    "rdkafka config key {:?} defined in both connection and table config",
+                    "Kafka config key {:?} defined in both connection and table config",
                     k
                 );
             }
@@ -979,10 +857,6 @@ pub fn client_configs(
     Ok(client_configs)
 }
 
-type BaseConsumer = rdkafka::consumer::BaseConsumer<Context>;
-type FutureProducer = rdkafka::producer::FutureProducer<Context>;
-type StreamConsumer = rdkafka::consumer::StreamConsumer<Context>;
-
 #[derive(Clone)]
 pub struct Context {
     config: Option<KafkaConfig>,
@@ -991,51 +865,5 @@ pub struct Context {
 impl Context {
     pub fn new(config: Option<KafkaConfig>) -> Self {
         Self { config }
-    }
-}
-
-impl ConsumerContext for Context {}
-
-impl ProducerContext for Context {
-    type DeliveryOpaque = ();
-    fn delivery(
-        &self,
-        _delivery_result: &rdkafka::message::DeliveryResult<'_>,
-        _delivery_opaque: Self::DeliveryOpaque,
-    ) {
-    }
-}
-
-impl ClientContext for Context {
-    const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;
-
-    fn generate_oauth_token(
-        &self,
-        _oauthbearer_config: Option<&str>,
-    ) -> Result<OAuthToken, Box<dyn std::error::Error>> {
-        if let Some(KafkaConfigAuthentication::AwsMskIam { region }) =
-            self.config.as_ref().map(|c| &c.authentication)
-        {
-            let region = Region::new(region.clone());
-
-            let (token, expiration_time_ms) = thread::spawn(move || {
-                tokio::runtime::Runtime::new()?
-                    .block_on(async {
-                        timeout(Duration::from_secs(10), generate_auth_token(region.clone())).await
-                    })
-                    .map_err(|e| anyhow!("timed out generating MSK oauth token {:?}", e))?
-                    .map_err(|e| anyhow!("signing error {:?}", e))
-            })
-            .join()
-            .map_err(|e| anyhow!("failed to join thread {:?}", e))??;
-
-            Ok(OAuthToken {
-                token,
-                principal_name: "".to_string(),
-                lifetime_ms: expiration_time_ms,
-            })
-        } else {
-            Err(anyhow!("only AWS_MSK_IAM is supported for sasl oauth").into())
-        }
     }
 }

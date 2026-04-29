@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::borrow::Cow;
 
 use arroyo_rpc::errors::DataflowResult;
@@ -7,12 +7,8 @@ use arroyo_rpc::{CheckpointEvent, ControlResp};
 use arroyo_types::*;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use tracing::{error, warn};
-
-use rdkafka::producer::{DeliveryFuture, FutureRecord, Producer};
-use rdkafka::util::Timeout;
-
-use rdkafka::ClientConfig;
+use std::hash::{Hash, Hasher};
+use tracing::warn;
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -23,10 +19,14 @@ use arroyo_rpc::df::ArroyoSchema;
 use arroyo_types::CheckpointBarrier;
 use async_trait::async_trait;
 use prost::Message;
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use std::time::{Duration, SystemTime};
+use rskafka::client::partition::PartitionClient;
+use std::sync::Arc;
+use std::time::SystemTime;
 
-use super::{Context, FutureProducer, SinkCommitMode};
+use super::client_utils::{
+    build_client, kafka_record, partition_client, produce_records, topic_metadata,
+};
+use super::{Context, SinkCommitMode};
 
 #[cfg(test)]
 mod test;
@@ -39,26 +39,28 @@ pub struct KafkaSinkFunc {
     pub timestamp_col: Option<usize>,
     pub key_field: Option<String>,
     pub key_col: Option<usize>,
-    pub producer: Option<FutureProducer>,
-    pub write_futures: Vec<DeliveryFuture>,
+    pub producer: Option<KafkaProducer>,
     pub client_config: HashMap<String, String>,
     pub context: Context,
     pub serializer: ArrowSerializer,
 }
 
+#[derive(Debug)]
+pub struct KafkaProducer {
+    partition_clients: Vec<Arc<PartitionClient>>,
+    next_partition: usize,
+}
+
 pub enum ConsistencyMode {
     AtLeastOnce,
-    ExactlyOnce {
-        next_transaction_index: usize,
-        producer_to_complete: Option<FutureProducer>,
-    },
+    ExactlyOnce,
 }
 
 impl Display for ConsistencyMode {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ConsistencyMode::AtLeastOnce => write!(f, "AtLeastOnce"),
-            ConsistencyMode::ExactlyOnce { .. } => write!(f, "ExactlyOnce"),
+            ConsistencyMode::ExactlyOnce => write!(f, "ExactlyOnce"),
         }
     }
 }
@@ -67,35 +69,30 @@ impl From<SinkCommitMode> for ConsistencyMode {
     fn from(commit_mode: SinkCommitMode) -> Self {
         match commit_mode {
             SinkCommitMode::AtLeastOnce => ConsistencyMode::AtLeastOnce,
-            SinkCommitMode::ExactlyOnce => ConsistencyMode::ExactlyOnce {
-                next_transaction_index: 0,
-                producer_to_complete: None,
-            },
+            SinkCommitMode::ExactlyOnce => ConsistencyMode::ExactlyOnce,
         }
     }
 }
 
 impl KafkaSinkFunc {
     fn set_timestamp_col(&mut self, schema: &ArroyoSchema) {
-        if let Some(f) = &self.timestamp_field {
-            if let Ok(f) = schema.schema.field_with_name(f) {
-                match f.data_type() {
+        if let Some(field_name) = &self.timestamp_field {
+            if let Ok(field) = schema.schema.field_with_name(field_name) {
+                match field.data_type() {
                     DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                        self.timestamp_col = Some(schema.schema.index_of(f.name()).unwrap());
+                        self.timestamp_col = Some(schema.schema.index_of(field.name()).unwrap());
                         return;
                     }
                     _ => {
                         warn!(
-                            "Kafka sink configured with timestamp_field '{f}', but it has type \
-                        {}, not TIMESTAMP... ignoring",
-                            f.data_type()
+                            "Kafka sink configured with timestamp_field '{field_name}', but it has type {}, not TIMESTAMP... ignoring",
+                            field.data_type()
                         );
                     }
                 }
             } else {
                 warn!(
-                    "Kafka sink configured with timestamp_field '{f}', but that \
-                does not appear in the schema... ignoring"
+                    "Kafka sink configured with timestamp_field '{field_name}', but that does not appear in the schema... ignoring"
                 );
             }
         }
@@ -104,121 +101,120 @@ impl KafkaSinkFunc {
     }
 
     fn set_key_col(&mut self, schema: &ArroyoSchema) {
-        if let Some(f) = &self.key_field {
-            if let Ok(f) = schema.schema.field_with_name(f) {
-                if matches!(f.data_type(), DataType::Utf8) {
-                    self.key_col = Some(schema.schema.index_of(f.name()).unwrap());
+        if let Some(field_name) = &self.key_field {
+            if let Ok(field) = schema.schema.field_with_name(field_name) {
+                if matches!(field.data_type(), DataType::Utf8) {
+                    self.key_col = Some(schema.schema.index_of(field.name()).unwrap());
                 } else {
                     warn!(
-                        "Kafka sink configured with key_field '{f}', but it has type \
-                {}, not TEXT... ignoring",
-                        f.data_type()
+                        "Kafka sink configured with key_field '{field_name}', but it has type {}, not TEXT... ignoring",
+                        field.data_type()
                     );
                 }
             } else {
                 warn!(
-                    "Kafka sink configured with key_field '{f}', but that \
-                does not appear in the schema... ignoring"
+                    "Kafka sink configured with key_field '{field_name}', but that does not appear in the schema... ignoring"
                 );
             }
         }
     }
 
-    fn init_producer(&mut self, task_info: &TaskInfo) -> Result<()> {
-        let mut client_config = ClientConfig::new();
-        client_config.set("bootstrap.servers", &self.bootstrap_servers);
-        for (key, value) in &self.client_config {
-            client_config.set(key, value);
+    async fn init_producer(&mut self, task_info: &TaskInfo) -> Result<()> {
+        if matches!(self.consistency_mode, ConsistencyMode::ExactlyOnce) {
+            bail!(
+                "Kafka sinks configured with sink.commit_mode='exactly_once' are not supported by the rskafka client"
+            );
         }
 
-        match &mut self.consistency_mode {
-            ConsistencyMode::AtLeastOnce => {
-                self.producer = Some(client_config.create_with_context(self.context.clone())?);
-            }
-            ConsistencyMode::ExactlyOnce {
-                next_transaction_index,
-                ..
-            } => {
-                client_config.set("enable.idempotence", "true");
-                let transactional_id = format!(
-                    "arroyo-id-{}-{}-{}-{}-{}",
-                    task_info.job_id,
-                    task_info.operator_id,
-                    self.topic,
-                    task_info.task_index,
-                    next_transaction_index
-                );
-                client_config.set("transactional.id", transactional_id);
-                let producer: FutureProducer =
-                    client_config.create_with_context(self.context.clone())?;
-                producer.init_transactions(Timeout::After(Duration::from_secs(30)))?;
-                producer.begin_transaction()?;
-                *next_transaction_index += 1;
-                self.producer = Some(producer);
-            }
+        let client =
+            build_client(&self.bootstrap_servers, &self.client_config, &self.context).await?;
+        let metadata = topic_metadata(&client, &self.topic)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Kafka topic '{}' does not exist", self.topic))?;
+        let mut partition_clients = Vec::with_capacity(metadata.partitions.len());
+        for partition in metadata.partitions {
+            partition_clients.push(partition_client(&client, &self.topic, partition).await?);
         }
+        if partition_clients.is_empty() {
+            bail!("Kafka topic '{}' has no partitions", self.topic);
+        }
+
+        self.producer = Some(KafkaProducer {
+            partition_clients,
+            next_partition: task_info.task_index as usize,
+        });
         Ok(())
     }
 
-    async fn flush(&mut self, ctx: &mut OperatorContext) {
-        self.producer
-            .as_ref()
-            .unwrap()
-            // FutureProducer has a thread polling every 100ms,
-            // but better to send a signal immediately
-            // Duration 0 timeouts are non-blocking,
-            .poll(Timeout::After(Duration::ZERO));
+    async fn flush(&mut self, _ctx: &mut OperatorContext) {}
 
-        // ensure all messages were delivered before finishing the checkpoint
-        for future in self.write_futures.drain(..) {
-            if let Err((e, _)) = future.await.unwrap() {
+    async fn publish_batch(
+        &mut self,
+        batch: RecordBatch,
+        ctx: &mut OperatorContext,
+    ) -> DataflowResult<()> {
+        let values = self.serializer.serialize(&batch);
+        let timestamps = batch
+            .column(
+                self.timestamp_col
+                    .expect("timestamp column not initialized!"),
+            )
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>();
+        let keys = self
+            .key_col
+            .map(|index| batch.column(index).as_string::<i32>());
+
+        let producer = self
+            .producer
+            .as_mut()
+            .expect("Kafka producer not initialized");
+        let mut by_partition: HashMap<usize, Vec<rskafka::record::Record>> = HashMap::new();
+
+        for (index, value) in values.enumerate() {
+            let timestamp = timestamps.map(|ts| {
+                if ts.is_null(index) {
+                    0
+                } else {
+                    ts.value(index) / 1_000_000
+                }
+            });
+            let key = keys.map(|column| column.value(index).as_bytes().to_vec());
+            let partition = producer.select_partition(key.as_deref());
+            by_partition
+                .entry(partition)
+                .or_default()
+                .push(kafka_record(key, value, timestamp.unwrap_or(0)));
+        }
+
+        for (partition, records) in by_partition {
+            if let Err(error) =
+                produce_records(&producer.partition_clients[partition], records).await
+            {
                 ctx.error_reporter
-                    .report_error("Kafka producer shut down", e.to_string())
+                    .report_error("Could not write to Kafka", error.to_string())
                     .await;
-                panic!("Kafka producer shut down: {e:?}");
+                panic!("Failed to write to Kafka: {error}");
             }
         }
+
+        Ok(())
     }
+}
 
-    async fn publish(
-        &mut self,
-        ts: Option<i64>,
-        k: Option<Vec<u8>>,
-        v: Vec<u8>,
-        ctx: &mut OperatorContext,
-    ) {
-        let mut rec = {
-            let mut rec = FutureRecord::<Vec<u8>, Vec<u8>>::to(&self.topic);
-            if let Some(ts) = ts {
-                rec = rec.timestamp(ts);
+impl KafkaProducer {
+    fn select_partition(&mut self, key: Option<&[u8]>) -> usize {
+        match key {
+            Some(key) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                (hasher.finish() as usize) % self.partition_clients.len()
             }
-            if let Some(k) = k.as_ref() {
-                rec = rec.key(k);
+            None => {
+                let partition = self.next_partition % self.partition_clients.len();
+                self.next_partition = (self.next_partition + 1) % self.partition_clients.len();
+                partition
             }
-
-            rec.payload(&v)
-        };
-
-        loop {
-            match self.producer.as_mut().unwrap().send_result(rec) {
-                Ok(future) => {
-                    self.write_futures.push(future);
-                    return;
-                }
-                Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), f)) => {
-                    rec = f;
-                }
-                Err((e, _)) => {
-                    ctx.error_reporter
-                        .report_error("Could not write to Kafka", format!("{e:?}"))
-                        .await;
-
-                    panic!("Failed to write to kafka: {e:?}");
-                }
-            }
-
-            // back off and retry
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -270,14 +266,14 @@ impl ArrowOperator for KafkaSinkFunc {
     }
 
     fn is_committing(&self) -> bool {
-        matches!(self.consistency_mode, ConsistencyMode::ExactlyOnce { .. })
+        matches!(self.consistency_mode, ConsistencyMode::ExactlyOnce)
     }
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
         self.set_timestamp_col(&ctx.in_schemas[0]);
         self.set_key_col(&ctx.in_schemas[0]);
-
         self.init_producer(&ctx.task_info)
+            .await
             .expect("Producer creation failed");
         Ok(())
     }
@@ -288,31 +284,7 @@ impl ArrowOperator for KafkaSinkFunc {
         ctx: &mut OperatorContext,
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        let values = self.serializer.serialize(&batch);
-        let timestamps = batch
-            .column(
-                self.timestamp_col
-                    .expect("timestamp column not initialized!"),
-            )
-            .as_any()
-            .downcast_ref::<arrow::array::TimestampNanosecondArray>();
-
-        let keys = self.key_col.map(|i| batch.column(i).as_string::<i32>());
-
-        for (i, v) in values.enumerate() {
-            // kafka timestamp as unix millis
-            let timestamp = timestamps.map(|ts| {
-                if ts.is_null(i) {
-                    0
-                } else {
-                    ts.value(i) / 1_000_000
-                }
-            });
-            // TODO: this copy should be unnecessary but likely needs a custom trait impl
-            let key = keys.map(|k| k.value(i).as_bytes().to_vec());
-            self.publish(timestamp, key, v, ctx).await;
-        }
-        Ok(())
+        self.publish_batch(batch, ctx).await
     }
 
     async fn handle_checkpoint(
@@ -322,22 +294,6 @@ impl ArrowOperator for KafkaSinkFunc {
         _: &mut dyn Collector,
     ) -> DataflowResult<()> {
         self.flush(ctx).await;
-        if let ConsistencyMode::ExactlyOnce {
-            next_transaction_index,
-            producer_to_complete,
-        } = &mut self.consistency_mode
-        {
-            *producer_to_complete = self.producer.take();
-            ctx.table_manager
-                .get_global_keyed_state("i")
-                .await
-                .as_mut()
-                .unwrap()
-                .insert(ctx.task_info.task_index, *next_transaction_index)
-                .await;
-            self.init_producer(&ctx.task_info)
-                .expect("creating new producer during checkpointing");
-        }
         Ok(())
     }
 
@@ -347,36 +303,11 @@ impl ArrowOperator for KafkaSinkFunc {
         _commit_data: &HashMap<String, HashMap<u32, Vec<u8>>>,
         ctx: &mut OperatorContext,
     ) -> DataflowResult<()> {
-        let ConsistencyMode::ExactlyOnce {
-            next_transaction_index: _,
-            producer_to_complete,
-        } = &mut self.consistency_mode
-        else {
+        if !self.is_committing() {
             warn!("received commit but consistency mode is not exactly once");
             return Ok(());
-        };
-
-        let Some(committing_producer) = producer_to_complete.take() else {
-            error!(
-                "received a commit message without a producer ready to commit. Restoring from commit phase not yet implemented"
-            );
-            return Ok(());
-        };
-
-        let mut commits_attempted = 0;
-        loop {
-            if committing_producer
-                .commit_transaction(Timeout::After(Duration::from_secs(10)))
-                .is_ok()
-            {
-                break;
-            } else if commits_attempted == 5 {
-                panic!("failed to commit 5 times, giving up");
-            } else {
-                error!("failed to commit {} times, retrying", commits_attempted);
-                commits_attempted += 1;
-            }
         }
+
         let checkpoint_event = ControlResp::CheckpointEvent(CheckpointEvent {
             checkpoint_epoch: epoch,
             operator_idx: ctx.task_info.operator_idx,

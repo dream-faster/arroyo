@@ -50,14 +50,8 @@ sha2 = "0.10"
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
-rdkafka = { version = "0.37", features = [
-    "cmake-build",
-    "tracing",
-    "sasl",
-    "ssl-vendored",
-    "zstd",
-] }
-sasl2-sys = { version = "0.1.22", features = ["vendored"] }
+rskafka = { git = "https://github.com/influxdata/rskafka", features = ["transport-tls"] }
+rustls023 = { package = "rustls", version = "0.23.27" }
 
 # SSE
 eventsource-client = "0.13.0"

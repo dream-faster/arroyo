@@ -15,15 +15,15 @@ use arroyo_rpc::formats::{Format, JsonFormat};
 use arroyo_types::CheckpointBarrier;
 use arroyo_types::*;
 use itertools::Itertools;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic};
-use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::producer::Producer;
-use rdkafka::{ClientConfig, Message};
+use rskafka::client::consumer::StartOffset;
 use serde::Deserialize;
 use tokio::sync::mpsc::channel;
 
 use super::{ConsistencyMode, KafkaSinkFunc};
-use crate::kafka::Context;
+use crate::kafka::client_utils::{
+    build_client, create_topic, delete_topic, partition_client, spawn_partition_consumers,
+};
+use crate::kafka::{Context, KafkaConfig, KafkaConfigAuthentication};
 use crate::test::DummyCollector;
 
 pub struct KafkaTopicTester {
@@ -44,31 +44,29 @@ struct TestData {
     value: u32,
 }
 
+fn test_config(server: &str) -> KafkaConfig {
+    KafkaConfig {
+        authentication: KafkaConfigAuthentication::None {},
+        bootstrap_servers: crate::kafka::BootstrapServers(server.to_string()),
+        schema_registry_enum: None,
+        connection_properties: HashMap::new(),
+    }
+}
+
 impl KafkaTopicTester {
-    async fn create_topic(&self, job_id: &str, num_partitions: i32) {
-        let admin_client: AdminClient<_> = ClientConfig::new()
-            .set("bootstrap.servers", self.server.to_string())
-            .set("enable.auto.commit", "false")
-            // TODO: parameterize group id
-            .set("group.id", format!("{}-{}-creator", job_id, "operator_id"))
-            .create()
-            .unwrap();
-        admin_client
-            .delete_topics(&[&self.topic], &AdminOptions::new())
-            .await
-            .expect("deletion should have worked");
+    async fn create_topic(&self, num_partitions: i32) {
+        let client = build_client(
+            &self.server,
+            &HashMap::new(),
+            &Context::new(Some(test_config(&self.server))),
+        )
+        .await
+        .unwrap();
+        let _ = delete_topic(&client, &self.topic).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        admin_client
-            .create_topics(
-                [&NewTopic::new(
-                    &self.topic,
-                    num_partitions,
-                    rdkafka::admin::TopicReplication::Fixed(1),
-                )],
-                &AdminOptions::new(),
-            )
+        create_topic(&client, &self.topic, num_partitions)
             .await
-            .expect("new topic should be present");
+            .unwrap();
     }
 
     async fn get_sink_with_writes(&self) -> KafkaSinkWithWrites {
@@ -80,9 +78,8 @@ impl KafkaTopicTester {
             timestamp_field: None,
             timestamp_col: None,
             key_field: None,
-            write_futures: vec![],
             client_config: HashMap::new(),
-            context: Context::new(None),
+            context: Context::new(Some(test_config(&self.server))),
             serializer: ArrowSerializer::new(Format::Json(JsonFormat::default())),
             key_col: None,
         };
@@ -107,30 +104,52 @@ impl KafkaTopicTester {
         KafkaSinkWithWrites { sink: kafka, ctx }
     }
 
-    fn get_consumer(&mut self, job_id: &str) -> StreamConsumer {
-        let base_consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", self.server.to_string())
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            // TODO: parameterize group id
-            .set("group.id", format!("{}-{}-consumer", job_id, "operator_id"))
-            .set("group.instance.id", "0")
-            .create()
-            .expect("Consumer creation failed");
+    async fn get_consumer(&self, partitions: i32) -> KafkaTopicConsumer {
+        let client = build_client(
+            &self.server,
+            &HashMap::new(),
+            &Context::new(Some(test_config(&self.server))),
+        )
+        .await
+        .unwrap();
 
-        base_consumer.subscribe(&[&self.topic]).expect("success");
-        base_consumer
+        let mut consumers = Vec::new();
+        for partition in 0..partitions {
+            consumers.push((
+                partition,
+                partition_client(&client, &self.topic, partition)
+                    .await
+                    .unwrap(),
+                StartOffset::Earliest,
+            ));
+        }
+
+        let (rx, handles) = spawn_partition_consumers(&self.topic, consumers);
+        KafkaTopicConsumer { rx, handles }
     }
 }
 
-async fn get_data(consumer: &mut StreamConsumer) -> String {
-    let owned_message = consumer
+struct KafkaTopicConsumer {
+    rx: tokio::sync::mpsc::Receiver<anyhow::Result<crate::kafka::client_utils::ConsumedRecord>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for KafkaTopicConsumer {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+async fn get_data(consumer: &mut KafkaTopicConsumer) -> String {
+    let message = consumer
+        .rx
         .recv()
         .await
-        .expect("shouldn't have errored")
-        .detach();
-    let payload = owned_message.payload().unwrap();
-    String::from_utf8(payload.to_vec()).unwrap()
+        .expect("should receive a kafka record")
+        .expect("shouldn't have errored");
+    String::from_utf8(message.record.record.value.unwrap()).unwrap()
 }
 
 struct KafkaSinkWithWrites {
@@ -140,14 +159,14 @@ struct KafkaSinkWithWrites {
 
 #[tokio::test]
 async fn test_kafka_checkpoint_flushes() {
-    let mut kafka_topic_tester = KafkaTopicTester {
+    let kafka_topic_tester = KafkaTopicTester {
         topic: "arroyo-sink-checkpoint".to_string(),
         server: "0.0.0.0:9092".to_string(),
     };
 
-    kafka_topic_tester.create_topic("checkpoint", 1).await;
+    kafka_topic_tester.create_topic(1).await;
     let mut sink_with_writes = kafka_topic_tester.get_sink_with_writes().await;
-    let mut consumer = kafka_topic_tester.get_consumer("0");
+    let mut consumer = kafka_topic_tester.get_consumer(1).await;
 
     for chunk in &(1u32..200).chunks(7) {
         let array = UInt32Array::from_iter_values(chunk.into_iter());
@@ -180,14 +199,14 @@ async fn test_kafka_checkpoint_flushes() {
 
 #[tokio::test]
 async fn test_kafka() {
-    let mut kafka_topic_tester = KafkaTopicTester {
+    let kafka_topic_tester = KafkaTopicTester {
         topic: "arroyo-sink".to_string(),
         server: "0.0.0.0:9092".to_string(),
     };
 
-    kafka_topic_tester.create_topic("basic", 2).await;
+    kafka_topic_tester.create_topic(2).await;
     let mut sink_with_writes = kafka_topic_tester.get_sink_with_writes().await;
-    let mut consumer = kafka_topic_tester.get_consumer("1");
+    let mut consumer = kafka_topic_tester.get_consumer(2).await;
 
     for message in 1u32..20 {
         let data = UInt32Array::from_iter_values(vec![message].into_iter());
@@ -197,13 +216,6 @@ async fn test_kafka() {
             .sink
             .process_batch(batch, &mut sink_with_writes.ctx, &mut DummyCollector {})
             .await
-            .unwrap();
-        sink_with_writes
-            .sink
-            .producer
-            .as_ref()
-            .unwrap()
-            .flush(Duration::from_secs(3))
             .unwrap();
 
         let result: TestData = serde_json::from_str(&get_data(&mut consumer).await).unwrap();

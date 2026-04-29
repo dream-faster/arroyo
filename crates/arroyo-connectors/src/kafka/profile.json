@@ -108,7 +108,7 @@
         "connectionProperties": {
             "type": "object",
             "title": "Connection Properties",
-            "description": "Key-value pairs of rdkafka configuration options",
+            "description": "Key-value pairs of advanced Kafka client options supported by Arroyo's rskafka-based client",
             "items": {
                 "type": "string",
                 "title": "property"

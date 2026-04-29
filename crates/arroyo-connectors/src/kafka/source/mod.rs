@@ -1,10 +1,7 @@
 use anyhow::{Context as _, bail};
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use futures::FutureExt;
 use governor::{Quota, RateLimiter as GovernorRateLimiter};
-use rdkafka::consumer::{CommitMode, Consumer};
-use rdkafka::{ClientConfig, Message as KMessage, Offset, TopicPartitionList};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -21,10 +18,13 @@ use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::formats::{BadData, Format, Framing};
 use arroyo_rpc::grpc::rpc::TableConfig;
 use arroyo_rpc::schema_resolver::SchemaResolver;
-use arroyo_rpc::{ControlMessage, MetadataField, connector_err, grpc::rpc::StopMode};
+use arroyo_rpc::{ControlMessage, MetadataField, grpc::rpc::StopMode};
 use arroyo_types::*;
 
-use super::{Context, SourceOffset, StreamConsumer};
+use super::client_utils::{
+    build_client, partition_client, spawn_partition_consumers, start_offset, topic_metadata,
+};
+use super::{Context, SourceOffset};
 
 #[cfg(test)]
 mod test;
@@ -52,48 +52,33 @@ pub struct KafkaState {
 }
 
 impl KafkaSourceFunc {
-    async fn get_consumer(&mut self, ctx: &mut SourceContext) -> anyhow::Result<StreamConsumer> {
+    async fn build_partition_consumers(
+        &self,
+        ctx: &mut SourceContext,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::Receiver<anyhow::Result<super::client_utils::ConsumedRecord>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    )> {
         info!("Creating kafka consumer for {}", self.bootstrap_servers);
-        let mut client_config = ClientConfig::new();
 
-        let group_id = match (&self.group_id, &self.group_id_prefix) {
-            (Some(group_id), prefix) => {
-                if prefix.is_some() {
-                    warn!(
-                        "both group_id and group_id_prefix are set for Kafka source; using group_id"
-                    );
-                }
-                group_id.clone()
-            }
-            (None, Some(prefix)) => {
-                format!(
-                    "{}-arroyo-{}-{}",
-                    prefix, ctx.task_info.job_id, ctx.task_info.operator_id
-                )
-            }
-            (None, None) => {
-                format!(
-                    "arroyo-{}-{}-consumer",
-                    ctx.task_info.job_id, ctx.task_info.operator_id
-                )
-            }
-        };
-
-        for (key, value) in &self.client_configs {
-            client_config.set(key, value);
+        if self.offset_mode == SourceOffset::Group {
+            bail!(
+                "Kafka sources configured with source.offset='group' are not supported by the rskafka client"
+            );
         }
-        let consumer: StreamConsumer = client_config
-            .set("bootstrap.servers", &self.bootstrap_servers)
-            .set("enable.partition.eof", "false")
-            .set("enable.auto.commit", "false")
-            .set("group.id", group_id)
-            .create_with_context(self.context.clone())?;
-
-        // NOTE: this is required to trigger an oauth token refresh (when using
-        // OAUTHBEARER auth).
-        if consumer.recv().now_or_never().is_some() {
-            bail!("unexpected recv before assignments");
+        if self.group_id.is_some() || self.group_id_prefix.is_some() {
+            warn!(
+                "Kafka source group_id/group_id_prefix are ignored with the rskafka client because Arroyo manages partition assignment and offsets itself"
+            );
         }
+
+        let client = build_client(&self.bootstrap_servers, &self.client_configs, &self.context)
+            .await
+            .context("creating Kafka client")?;
+        let metadata = topic_metadata(&client, &self.topic)
+            .await
+            .context("reading Kafka topic metadata")?
+            .ok_or_else(|| anyhow::anyhow!("Kafka topic '{}' does not exist", self.topic))?;
 
         let state: Vec<_> = ctx
             .table_manager
@@ -103,51 +88,45 @@ impl KafkaSourceFunc {
             .values()
             .collect();
 
-        // did we restore any partitions?
         let has_state = !state.is_empty();
-
         let state: HashMap<i32, KafkaState> = state.iter().map(|s| (s.partition, **s)).collect();
-        let metadata = consumer.fetch_metadata(Some(&self.topic), Duration::from_secs(30))?;
 
-        info!("Fetched metadata for topic {}", self.topic);
-
-        let our_partitions: HashMap<_, _> = {
-            let partitions = metadata.topics()[0].partitions();
-            partitions
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| {
-                    i % ctx.task_info.parallelism as usize == ctx.task_info.task_index as usize
-                })
-                .map(|(_, p)| {
-                    let offset = state
-                        .get(&p.id())
-                        .map(|s| Offset::Offset(s.offset))
-                        .unwrap_or_else(|| {
-                            if has_state {
-                                // if we've restored partitions and we don't know about this one, that means it's
-                                // new, and we want to start from the beginning so we don't drop data
-                                Offset::Beginning
-                            } else {
-                                self.offset_mode.get_offset()
-                            }
-                        });
-
-                    ((self.topic.clone(), p.id()), offset)
-                })
-                .collect()
-        };
+        let our_partitions: Vec<_> = metadata
+            .partitions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                index % ctx.task_info.parallelism as usize == ctx.task_info.task_index as usize
+            })
+            .map(|(_, partition)| *partition)
+            .collect();
 
         info!(
             "partition map for {}-{}: {:?}",
             self.topic, ctx.task_info.task_index, our_partitions
         );
 
-        let topic_partitions = TopicPartitionList::from_topic_map(&our_partitions)?;
+        let mut consumers = Vec::with_capacity(our_partitions.len());
+        for partition in our_partitions {
+            let start_offset = match state.get(&partition) {
+                Some(restored_state) => {
+                    start_offset(self.offset_mode, Some(restored_state.offset))?
+                }
+                None if has_state => {
+                    super::client_utils::start_offset(SourceOffset::Earliest, None)?
+                }
+                None => start_offset(self.offset_mode, None)?,
+            };
+            consumers.push((
+                partition,
+                partition_client(&client, &self.topic, partition)
+                    .await
+                    .with_context(|| format!("creating partition client for {}", partition))?,
+                start_offset,
+            ));
+        }
 
-        consumer.assign(&topic_partitions)?;
-
-        Ok(consumer)
+        Ok(spawn_partition_consumers(&self.topic, consumers))
     }
 
     async fn run_int(
@@ -155,15 +134,15 @@ impl KafkaSourceFunc {
         ctx: &mut SourceContext,
         collector: &mut SourceCollector,
     ) -> DataflowResult<SourceFinishType> {
-        let consumer = self
-            .get_consumer(ctx)
+        let (mut records_rx, consumer_handles) = self
+            .build_partition_consumers(ctx)
             .await
             .context("creating kafka consumer")?;
 
         let rate_limiter = GovernorRateLimiter::direct(Quota::per_second(self.messages_per_second));
         let mut offsets = HashMap::new();
 
-        if consumer.assignment().unwrap().count() == 0 {
+        if consumer_handles.is_empty() {
             warn!(
                 "Kafka Consumer {}-{} is subscribed to no partitions, as there are more subtasks than partitions... setting idle",
                 ctx.task_info.operator_id, ctx.task_info.task_index
@@ -193,27 +172,24 @@ impl KafkaSourceFunc {
         let mut flush_ticker = tokio::time::interval(Duration::from_millis(50));
         flush_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        loop {
+        let finish = loop {
             select! {
-                message = consumer.recv() => {
+                message = records_rx.recv() => {
                     match message {
-                        Ok(msg) => {
-                            if let Some(v) = msg.payload() {
-                                let timestamp = msg.timestamp().to_millis()
-                                    .ok_or_else(|| connector_err!(External, NoRetry, "Failed to read timestamp from Kafka record: The message read from Kafka did not contain a message timestamp"))?;
-
-                                let topic = msg.topic();
+                        Some(Ok(msg)) => {
+                            if let Some(value) = msg.record.record.value.as_ref() {
+                                let timestamp = msg.record.record.timestamp.timestamp_millis();
 
                                 let connector_metadata = if !self.metadata_fields.is_empty() {
                                     let mut connector_metadata = HashMap::new();
-                                    for f in &self.metadata_fields {
-                                        connector_metadata.insert(f.field_name.as_str(), match f.key.as_str() {
-                                            "key" => FieldValueType::Bytes(msg.key()),
-                                            "offset_id" => FieldValueType::Int64(Some(msg.offset())),
-                                            "partition" => FieldValueType::Int32(Some(msg.partition())),
-                                            "topic" => FieldValueType::String(Some(topic)),
+                                    for field in &self.metadata_fields {
+                                        connector_metadata.insert(field.field_name.as_str(), match field.key.as_str() {
+                                            "key" => FieldValueType::Bytes(msg.record.record.key.as_deref()),
+                                            "offset_id" => FieldValueType::Int64(Some(msg.record.offset)),
+                                            "partition" => FieldValueType::Int32(Some(msg.partition)),
+                                            "topic" => FieldValueType::String(Some(self.topic.as_str())),
                                             "timestamp" => FieldValueType::Int64(Some(timestamp)),
-                                            k => unreachable!("Invalid metadata key '{}'", k),
+                                            key => unreachable!("Invalid metadata key '{}'", key),
                                         });
                                     }
                                     Some(connector_metadata)
@@ -221,19 +197,26 @@ impl KafkaSourceFunc {
                                     None
                                 };
 
-                                collector.deserialize_slice(v, from_millis(timestamp.max(0) as u64), connector_metadata.as_ref()).await?;
+                                collector
+                                    .deserialize_slice(
+                                        value,
+                                        from_millis(timestamp.max(0) as u64),
+                                        connector_metadata.as_ref(),
+                                    )
+                                    .await?;
 
                                 if collector.should_flush() {
                                     collector.flush_buffer().await?;
                                 }
 
-                                offsets.insert(msg.partition(), msg.offset());
+                                offsets.insert(msg.partition, msg.record.offset);
                                 rate_limiter.until_ready().await;
                             }
-                        },
-                        Err(err) => {
-                            error!("encountered error {}", err)
                         }
+                        Some(Err(err)) => {
+                            error!("encountered error {}", err);
+                        }
+                        None => {}
                     }
                 }
                 _ = flush_ticker.tick() => {
@@ -245,37 +228,25 @@ impl KafkaSourceFunc {
                     match control_message {
                         Some(ControlMessage::Checkpoint(c)) => {
                             debug!("starting checkpointing {}", ctx.task_info.task_index);
-                            let mut topic_partitions = TopicPartitionList::new();
-                            let s = ctx.table_manager.get_global_keyed_state("k").await?;
+                            let state = ctx.table_manager.get_global_keyed_state("k").await?;
                             for (partition, offset) in &offsets {
-                                s.insert(*partition, KafkaState {
+                                state.insert(*partition, KafkaState {
                                     partition: *partition,
                                     offset: *offset + 1,
                                 }).await;
-                                topic_partitions.add_partition_offset(
-                                    &self.topic, *partition, Offset::Offset(*offset)).unwrap();
                             }
 
-                            if let Err(e) = consumer.commit(&topic_partitions, CommitMode::Async) {
-                                // This is just used for progress tracking for metrics, so it's not a fatal error if it
-                                // fails. The actual offset is stored in state.
-                                warn!("Failed to commit offset to Kafka {:?}", e);
-                            }
                             if self.start_checkpoint(c, ctx, collector).await {
-                                return Ok(SourceFinishType::Immediate);
+                                break SourceFinishType::Immediate;
                             }
                         },
                         Some(ControlMessage::Stop { mode }) => {
                             info!("Stopping kafka source: {:?}", mode);
 
-                            match mode {
-                                StopMode::Graceful => {
-                                    return Ok(SourceFinishType::Graceful);
-                                }
-                                StopMode::Immediate => {
-                                    return Ok(SourceFinishType::Immediate);
-                                }
-                            }
+                            break match mode {
+                                StopMode::Graceful => SourceFinishType::Graceful,
+                                StopMode::Immediate => SourceFinishType::Immediate,
+                            };
                         }
                         Some(ControlMessage::Commit { .. }) => {
                             unreachable!("sources shouldn't receive commit messages");
@@ -284,13 +255,17 @@ impl KafkaSourceFunc {
                             ctx.load_compacted(compacted).await;
                         }
                         Some(ControlMessage::NoOp) => {}
-                        None => {
-
-                        }
+                        None => {}
                     }
                 }
             }
+        };
+
+        for handle in consumer_handles {
+            handle.abort();
         }
+
+        Ok(finish)
     }
 }
 

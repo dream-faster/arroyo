@@ -17,7 +17,7 @@
                     "properties": {
                         "offset": {
                             "type": "string",
-                            "description": "The offset to start reading from",
+                            "description": "The offset to start reading from. `group` is retained for compatibility but is not supported by the current rskafka-based implementation.",
                             "enum": [
                                 "latest",
                                 "earliest",
@@ -27,7 +27,7 @@
                         "read_mode": {
                             "type": "string",
                             "title": "read mode",
-                            "description": "Controls whether the source will wait for messages to be committed; use `read_committed` for transactional sources.",
+                            "description": "Controls whether the source will wait for messages to be committed; `read_committed` is retained for compatibility but is not supported by the current rskafka-based implementation.",
                             "enum": [
                                 "read_uncommitted",
                                 "read_committed"
@@ -36,12 +36,12 @@
                         "group_id": {
                             "type": "string",
                             "title": "group id",
-                            "description": "Sets the Group ID of the consumer for Kafka source. If not specified, an automatically generated ID will be used. Overrides group_id_prefix if set. CAUTION: Using one consumer group for multiple pipelines may result in incomplete data"
+                            "description": "Legacy consumer group identifier retained for compatibility. Arroyo manages Kafka partition assignment and offsets itself with the current rskafka-based implementation."
                         },
                         "group_id_prefix": {
                             "type": "string",
                             "title": "group id prefix",
-                            "description": "Optional prefix for the Group ID for the consumer for the Kafka source."
+                            "description": "Legacy consumer group prefix retained for compatibility. Arroyo manages Kafka partition assignment and offsets itself with the current rskafka-based implementation."
                         }
                     },
                     "required": [
@@ -55,7 +55,7 @@
                     "properties": {
                         "commit_mode": {
                             "type": "string",
-                            "description": "Committing behavior for Kafka Sink. For transactional commits, use `exactly_once`. For non-transactional commits, use `at_least_once`. ",
+                            "description": "Committing behavior for Kafka Sink. `exactly_once` is retained for compatibility but is not supported by the current rskafka-based implementation; use `at_least_once`.",
                             "enum": [
                                 "at_least_once",
                                 "exactly_once"
@@ -82,7 +82,7 @@
         "client_configs": {
             "type": "object",
             "title": "Client Configs",
-            "description": "Additional Kafka configs to pass to the underlying Kafka consumer or producer. See [Kafka Consumer Configs](https://kafka.apache.org/documentation/#consumerconfigs) and [Kafka Producer Configs](https://kafka.apache.org/documentation/#producerconfigs) for more details.",
+            "description": "Additional Kafka configs to pass through when supported by Arroyo's rskafka-based client. See [Kafka Consumer Configs](https://kafka.apache.org/documentation/#consumerconfigs) and [Kafka Producer Configs](https://kafka.apache.org/documentation/#producerconfigs) for more details.",
             "additionalProperties": {
                 "type": "string"
             }
