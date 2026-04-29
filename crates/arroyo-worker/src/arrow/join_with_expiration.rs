@@ -1,5 +1,7 @@
 use arrow::compute::concat_batches;
-use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::TimestampNanosecondType;
+use arrow_array::{Array, RecordBatch};
 use arroyo_operator::context::{Collector, OperatorContext};
 use arroyo_operator::operator::{
     ArrowOperator, AsDisplayable, ConstructedOperator, DisplayableOperator, OperatorConstructor,
@@ -26,6 +28,15 @@ use std::{
 };
 use tracing::warn;
 
+/// Indices (in the *unkeyed* left/right schemas) of the timestamp columns used
+/// to enforce ASOF semantics: a left row matches the single most recent right
+/// row whose key matches and whose timestamp is `<=` the left row's timestamp.
+#[derive(Copy, Clone, Debug)]
+struct AsofConfig {
+    left_ts_index: usize,
+    right_ts_index: usize,
+}
+
 pub struct JoinWithExpiration {
     left_expiration: Duration,
     right_expiration: Duration,
@@ -36,6 +47,7 @@ pub struct JoinWithExpiration {
     left_passer: Arc<RwLock<Option<RecordBatch>>>,
     right_passer: Arc<RwLock<Option<RecordBatch>>>,
     join_execution_plan: Arc<dyn ExecutionPlan>,
+    asof: Option<AsofConfig>,
 }
 
 impl JoinWithExpiration {
@@ -45,6 +57,10 @@ impl JoinWithExpiration {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.asof.is_some() {
+            return self.process_left_asof(record_batch, ctx, collector).await;
+        }
+
         let left_table = ctx
             .table_manager
             .get_key_time_table("left", ctx.last_present_watermark())
@@ -78,6 +94,10 @@ impl JoinWithExpiration {
         ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
+        if self.asof.is_some() {
+            return self.process_right_asof(right_batch, ctx, collector).await;
+        }
+
         let right_table = ctx
             .table_manager
             .get_key_time_table("right", ctx.last_present_watermark())
@@ -103,6 +123,125 @@ impl JoinWithExpiration {
             collector,
         )
         .await?;
+
+        Ok(())
+    }
+
+    /// ASOF semantics, left arrival: for each new left row, look up matching
+    /// right rows by key, pick the single right row with the largest
+    /// `right_ts <= left_ts`, and feed that pair to the inner-join physical
+    /// plan.
+    async fn process_left_asof(
+        &mut self,
+        record_batch: RecordBatch,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let cfg = self.asof.expect("asof config required");
+
+        for i in 0..record_batch.num_rows() {
+            let keyed_row = record_batch.slice(i, 1);
+            let unkeyed_row = self.left_input_schema.unkeyed_batch(&keyed_row)?;
+            let left_ts = ts_value(&unkeyed_row, cfg.left_ts_index)?;
+
+            // Insert the left row and capture the storage key for the lookup.
+            let left_table = ctx
+                .table_manager
+                .get_key_time_table("left", ctx.last_present_watermark())
+                .await?;
+            let mut key_rows = left_table.insert(keyed_row).await?;
+            let Some(key_row) = key_rows.pop() else {
+                continue;
+            };
+
+            let right_table = ctx
+                .table_manager
+                .get_key_time_table("right", ctx.last_present_watermark())
+                .await?;
+            let Some(candidates) = right_table.get_batch(key_row.as_ref())? else {
+                continue;
+            };
+            let candidates = candidates.clone();
+
+            if let Some(best_idx) = pick_asof_right(&candidates, cfg.right_ts_index, left_ts)? {
+                let best_right = candidates.slice(best_idx, 1);
+                self.compute_pair(unkeyed_row, best_right, collector)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// ASOF semantics, right arrival: for each new right row, look up matching
+    /// left rows by key. The new right row is the ASOF match for a buffered
+    /// left row iff `right_ts <= left_ts` and no other already-buffered right
+    /// row falls in `(right_ts, left_ts]`.
+    async fn process_right_asof(
+        &mut self,
+        right_batch: RecordBatch,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let cfg = self.asof.expect("asof config required");
+
+        for i in 0..right_batch.num_rows() {
+            let keyed_row = right_batch.slice(i, 1);
+            let unkeyed_row = self.right_input_schema.unkeyed_batch(&keyed_row)?;
+            let new_right_ts = ts_value(&unkeyed_row, cfg.right_ts_index)?;
+
+            let right_table = ctx
+                .table_manager
+                .get_key_time_table("right", ctx.last_present_watermark())
+                .await?;
+            let mut key_rows = right_table.insert(keyed_row).await?;
+            let Some(key_row) = key_rows.pop() else {
+                continue;
+            };
+
+            // After insertion, look up the full buffered right state for this
+            // key and the buffered left rows.
+            let right_table = ctx
+                .table_manager
+                .get_key_time_table("right", ctx.last_present_watermark())
+                .await?;
+            let Some(all_right_for_key) = right_table.get_batch(key_row.as_ref())? else {
+                continue;
+            };
+            let all_right_for_key = all_right_for_key.clone();
+
+            let left_table = ctx
+                .table_manager
+                .get_key_time_table("left", ctx.last_present_watermark())
+                .await?;
+            let Some(left_candidates) = left_table.get_batch(key_row.as_ref())? else {
+                continue;
+            };
+            let left_candidates = left_candidates.clone();
+
+            for j in 0..left_candidates.num_rows() {
+                let left_row = left_candidates.slice(j, 1);
+                let left_ts = ts_value(&left_row, cfg.left_ts_index)?;
+
+                if new_right_ts > left_ts {
+                    continue;
+                }
+                let Some(best_idx) =
+                    pick_asof_right(&all_right_for_key, cfg.right_ts_index, left_ts)?
+                else {
+                    continue;
+                };
+                let best_ts = ts_value(&all_right_for_key.slice(best_idx, 1), cfg.right_ts_index)?;
+                if best_ts != new_right_ts {
+                    // A previously-buffered right row is still the ASOF
+                    // match; emitting now would duplicate an earlier
+                    // emission.
+                    continue;
+                }
+                self.compute_pair(left_row, unkeyed_row.clone(), collector)
+                    .await?;
+            }
+        }
 
         Ok(())
     }
@@ -258,7 +397,68 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
                 left_passer,
                 right_passer,
                 join_execution_plan,
+                asof: config.asof.map(|a| AsofConfig {
+                    left_ts_index: a.left_ts_index as usize,
+                    right_ts_index: a.right_ts_index as usize,
+                }),
             },
         )))
     }
+}
+
+/// Read the `i64` value at row 0 of the timestamp column of a single-row
+/// (unkeyed) batch. ASOF joins require the timestamp column to be a
+/// `Timestamp(Nanosecond)` (the canonical Arroyo event-time representation).
+fn ts_value(batch: &RecordBatch, idx: usize) -> DataflowResult<i64> {
+    let arr = batch.column(idx);
+    let ts = arr
+        .as_primitive_opt::<TimestampNanosecondType>()
+        .ok_or_else(|| {
+            arrow::error::ArrowError::InvalidArgumentError(format!(
+                "ASOF JOIN expected a Timestamp(Nanosecond) column at index {idx}, got {:?}",
+                arr.data_type()
+            ))
+        })?;
+    if ts.is_null(0) {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(
+            "ASOF JOIN does not support NULL timestamps".into(),
+        )
+        .into());
+    }
+    Ok(ts.value(0))
+}
+
+/// Return the index in `candidates` of the row with the largest `right_ts`
+/// value that is still `<=` `left_ts`, or `None` if no such row exists. NULL
+/// timestamps are skipped.
+fn pick_asof_right(
+    candidates: &RecordBatch,
+    right_ts_index: usize,
+    left_ts: i64,
+) -> DataflowResult<Option<usize>> {
+    let arr = candidates.column(right_ts_index);
+    let ts = arr
+        .as_primitive_opt::<TimestampNanosecondType>()
+        .ok_or_else(|| {
+            arrow::error::ArrowError::InvalidArgumentError(format!(
+                "ASOF JOIN expected a Timestamp(Nanosecond) column at index {right_ts_index}, got {:?}",
+                arr.data_type()
+            ))
+        })?;
+
+    let mut best: Option<(usize, i64)> = None;
+    for i in 0..ts.len() {
+        if ts.is_null(i) {
+            continue;
+        }
+        let v = ts.value(i);
+        if v > left_ts {
+            continue;
+        }
+        match best {
+            Some((_, b)) if b >= v => {}
+            _ => best = Some((i, v)),
+        }
+    }
+    Ok(best.map(|(i, _)| i))
 }

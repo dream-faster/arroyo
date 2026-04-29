@@ -1,4 +1,5 @@
-use crate::extension::join::JoinExtension;
+use crate::asof::ASOF_MARKER_UDF;
+use crate::extension::join::{AsofConfig, JoinExtension};
 use crate::extension::key_calculation::KeyCalculationExtension;
 use crate::extension::lookup::{LookupJoin, LookupSource};
 use crate::plan::WindowDetectingVisitor;
@@ -11,13 +12,13 @@ use datafusion::common::tree_node::{
     Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter, TreeNodeVisitor,
 };
 use datafusion::common::{
-    Column, DataFusionError, JoinConstraint, JoinType, Result, ScalarValue, Spans, TableReference,
-    not_impl_err, plan_err,
+    Column, DFSchema, DataFusionError, JoinConstraint, JoinType, Result, ScalarValue, Spans,
+    TableReference, not_impl_err, plan_err,
 };
 use datafusion::logical_expr;
-use datafusion::logical_expr::expr::Alias;
+use datafusion::logical_expr::expr::{Alias, ScalarFunction};
 use datafusion::logical_expr::{
-    BinaryExpr, Case, Expr, Extension, Join, LogicalPlan, Projection, build_join_schema,
+    BinaryExpr, Case, Expr, Extension, Join, LogicalPlan, Operator, Projection, build_join_schema,
 };
 use datafusion::prelude::coalesce;
 use datafusion::sql::unparser::expr_to_sql;
@@ -322,13 +323,27 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             return Ok(Transformed::yes(plan));
         }
 
-        let is_instant = Self::check_join_windowing(&join)?;
+        // Detect and consume an ASOF marker (`_arroyo_asof(left_ts, right_ts)`)
+        // injected by the AST pre-pass in `crate::asof`. If found, capture the
+        // timestamp expressions and remove the marker from the join's filter.
+        let (asof_marker, filter_without_marker) = take_asof_marker(join.filter.clone())?;
+
+        let is_asof = asof_marker.is_some();
+        if is_asof {
+            check_asof_join(&join)?;
+        }
+
+        let is_instant = if is_asof {
+            false
+        } else {
+            Self::check_join_windowing(&join)?
+        };
 
         let Join {
             left,
             right,
             on,
-            filter,
+            filter: _,
             join_type,
             join_constraint: JoinConstraint::On,
             schema: _,
@@ -346,8 +361,24 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         let (left_expressions, right_expressions): (Vec<_>, Vec<_>) =
             on.clone().into_iter().unzip();
 
+        // For ASOF, locate the timestamp column indices in the pre-key-calc
+        // (unkeyed) input schemas. The marker args reference columns from
+        // these schemas, and `unkeyed_batch()` at runtime exposes columns in
+        // the same order.
+        let asof = if let Some((left_ts_expr, right_ts_expr)) = asof_marker {
+            let left_idx = column_index(left.schema(), &left_ts_expr, "left")?;
+            let right_idx = column_index(right.schema(), &right_ts_expr, "right")?;
+            Some(AsofConfig {
+                left_ts_index: left_idx as u32,
+                right_ts_index: right_idx as u32,
+            })
+        } else {
+            None
+        };
+
         let left_input = Self::create_join_key_plan(left, left_expressions, "left")?;
         let right_input = Self::create_join_key_plan(right, right_expressions, "right")?;
+
         let rewritten_join = LogicalPlan::Join(Join {
             schema: Arc::new(build_join_schema(
                 left_input.schema(),
@@ -360,7 +391,7 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             join_type,
             join_constraint: JoinConstraint::On,
             null_equals_null: false,
-            filter,
+            filter: filter_without_marker,
         });
 
         let final_logical_plan = self.post_join_timestamp_projection(rewritten_join)?;
@@ -368,12 +399,101 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         let join_extension = JoinExtension {
             rewritten_join: final_logical_plan,
             is_instant,
-            // only non-instant (updating) joins have a TTL
+            // both ASOF and updating joins use the keyed-by-time TTL state
             ttl: (!is_instant).then_some(self.schema_provider.planning_options.ttl),
+            asof,
         };
 
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(join_extension),
         })))
     }
+}
+
+type AsofExtractedFilter = (Option<(Expr, Expr)>, Option<Expr>);
+
+/// If `filter` contains exactly one `_arroyo_asof(left_ts, right_ts)` call,
+/// extract the two argument expressions and return the filter with that call
+/// stripped out (replaced by `TRUE`, then constant-folded).
+fn take_asof_marker(filter: Option<Expr>) -> Result<AsofExtractedFilter> {
+    let Some(filter) = filter else {
+        return Ok((None, None));
+    };
+
+    let mut found: Option<(Expr, Expr)> = None;
+    let transformed = filter.transform_up(&mut |e: Expr| {
+        if let Expr::ScalarFunction(ScalarFunction { func, args }) = &e
+            && func.name() == ASOF_MARKER_UDF
+        {
+            if found.is_some() {
+                return Err(DataFusionError::Plan(
+                    "multiple ASOF markers in a single join are not supported".to_string(),
+                ));
+            }
+            if args.len() != 2 {
+                return Err(DataFusionError::Plan(format!(
+                    "{ASOF_MARKER_UDF} marker must have exactly 2 arguments"
+                )));
+            }
+            found = Some((args[0].clone(), args[1].clone()));
+            return Ok(Transformed::yes(Expr::Literal(
+                ScalarValue::Boolean(Some(true)),
+                None,
+            )));
+        }
+        Ok(Transformed::no(e))
+    })?;
+
+    let stripped = simplify_trivial_and(transformed.data);
+    Ok((found, stripped))
+}
+
+/// Drops `AND TRUE` / `TRUE AND` and reduces a top-level `Literal(true)` filter
+/// to `None`, leaving any remaining predicates untouched.
+fn simplify_trivial_and(expr: Expr) -> Option<Expr> {
+    match expr {
+        Expr::Literal(ScalarValue::Boolean(Some(true)), _) => None,
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => match (simplify_trivial_and(*left), simplify_trivial_and(*right)) {
+            (None, None) => None,
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (Some(l), Some(r)) => Some(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(l),
+                op: Operator::And,
+                right: Box::new(r),
+            })),
+        },
+        other => Some(other),
+    }
+}
+
+/// Validate ASOF join restrictions: inner join, no windows, non-updating.
+fn check_asof_join(join: &Join) -> Result<()> {
+    if join.join_type != JoinType::Inner {
+        return plan_err!("ASOF JOIN only supports INNER joins");
+    }
+    if WindowDetectingVisitor::get_window(&join.left)?.is_some()
+        || WindowDetectingVisitor::get_window(&join.right)?.is_some()
+    {
+        return plan_err!("ASOF JOIN does not support windowed inputs");
+    }
+    Ok(())
+}
+
+/// Resolve a marker argument to a column index in the given schema.
+fn column_index(schema: &DFSchema, expr: &Expr, side: &str) -> Result<usize> {
+    let Expr::Column(col) = expr else {
+        return plan_err!(
+            "ASOF JOIN MATCH_CONDITION arguments must be column references; got `{expr}` for the {side} side"
+        );
+    };
+    schema.index_of_column(col).map_err(|_| {
+        DataFusionError::Plan(format!(
+            "ASOF JOIN {side} timestamp column `{col}` not found in {side} input schema"
+        ))
+    })
 }

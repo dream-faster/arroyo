@@ -70,6 +70,13 @@ message SessionWindowAggregateOperator {
   bytes final_aggregation_plan = 8;
 }
 
+message AsofJoinConfig {
+  // Index of the left timestamp column in the keyed left schema.
+  uint32 left_ts_index = 1;
+  // Index of the right timestamp column in the keyed right schema.
+  uint32 right_ts_index = 2;
+}
+
 message JoinOperator {
   string name = 1;
   ArroyoSchema left_schema = 2;
@@ -77,6 +84,7 @@ message JoinOperator {
   ArroyoSchema output_schema = 4;
   bytes join_plan = 5;
   optional uint64 ttl_micros = 6;
+  optional AsofJoinConfig asof = 7;
 }
 
 message LookupJoinCondition {

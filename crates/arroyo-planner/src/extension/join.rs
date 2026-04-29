@@ -3,7 +3,7 @@ use crate::extension::{ArroyoExtension, NodeWithIncomingEdges};
 use crate::physical::ArroyoPhysicalExtensionCodec;
 use arroyo_datastream::logical::{LogicalEdge, LogicalEdgeType, LogicalNode, OperatorName};
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
-use arroyo_rpc::grpc::api::JoinOperator;
+use arroyo_rpc::grpc::api::{AsofJoinConfig, JoinOperator};
 use datafusion::common::{DFSchemaRef, Result, plan_err};
 use datafusion::logical_expr::expr::Expr;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNodeCore};
@@ -14,11 +14,20 @@ use std::time::Duration;
 
 pub(crate) const JOIN_NODE_NAME: &str = "JoinNode";
 
+/// Indices of the left and right timestamp columns (in the keyed input
+/// schemas) used to enforce ASOF semantics in the runtime operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AsofConfig {
+    pub left_ts_index: u32,
+    pub right_ts_index: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub struct JoinExtension {
     pub(crate) rewritten_join: LogicalPlan,
     pub(crate) is_instant: bool,
     pub(crate) ttl: Option<Duration>,
+    pub(crate) asof: Option<AsofConfig>,
 }
 
 impl ArroyoExtension for JoinExtension {
@@ -57,6 +66,10 @@ impl ArroyoExtension for JoinExtension {
             output_schema: Some(self.output_schema().into()),
             join_plan: physical_plan_node.encode_to_vec(),
             ttl_micros: self.ttl.map(|t| t.as_micros() as u64),
+            asof: self.asof.map(|a| AsofJoinConfig {
+                left_ts_index: a.left_ts_index,
+                right_ts_index: a.right_ts_index,
+            }),
         };
 
         let logical_node = LogicalNode::single(
@@ -109,6 +122,7 @@ impl UserDefinedLogicalNodeCore for JoinExtension {
             rewritten_join: inputs[0].clone(),
             is_instant: self.is_instant,
             ttl: self.ttl,
+            asof: self.asof,
         })
     }
 }
