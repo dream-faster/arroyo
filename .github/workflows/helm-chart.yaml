@@ -7,6 +7,16 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to publish from
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -18,6 +28,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Helm
         uses: azure/setup-helm@v4

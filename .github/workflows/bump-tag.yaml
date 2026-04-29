@@ -22,6 +22,8 @@ concurrency:
 jobs:
   bump-tag:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.next-tag.outputs.tag }}
     steps:
       - name: Check out master
         uses: actions/checkout@v4
@@ -81,3 +83,12 @@ jobs:
         run: |
           git tag -a "${NEXT_TAG}" -m "Release ${NEXT_TAG}"
           git push origin "refs/tags/${NEXT_TAG}"
+
+  publish-helm-chart:
+    needs: bump-tag
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/helm-chart.yaml
+    with:
+      ref: refs/tags/${{ needs.bump-tag.outputs.tag }}
