@@ -1,8 +1,6 @@
 use anyhow::{anyhow, bail};
 use arroyo_operator::connector::ErasedConnector;
-use arroyo_rpc::api_types::connections::{
-    ConnectionType, FieldType, SourceField, TestSourceMessage,
-};
+use arroyo_rpc::api_types::connections::{ConnectionType, FieldType, SourceField};
 use arroyo_rpc::var_str::VarStr;
 use arroyo_types::string_to_map;
 use reqwest::Client;
@@ -13,8 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::mpsc::Sender;
-use tracing::warn;
 
 pub mod blackhole;
 #[cfg(feature = "kafka")]
@@ -70,12 +66,6 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
 
 #[derive(Serialize, Deserialize)]
 pub struct EmptyConfig {}
-
-pub(crate) async fn send(tx: &mut Sender<TestSourceMessage>, msg: TestSourceMessage) {
-    if tx.send(msg).await.is_err() {
-        warn!("Test API rx closed while sending message");
-    }
-}
 
 pub fn connector_for_type(t: &str) -> Option<Box<dyn ErasedConnector>> {
     connectors().remove(t)
