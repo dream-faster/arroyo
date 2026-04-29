@@ -8,6 +8,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use duckdb::Connection;
+use duckdb::params_from_iter;
 use duckdb::vtab::arrow::{ArrowVTab, arrow_recordbatch_to_query_params};
 
 const QUERY: &str = "SELECT event_type, SUM(count) AS total \
@@ -116,20 +117,54 @@ fn make_batches(case: BenchmarkCase) -> Vec<RecordBatch> {
     batches
 }
 
+fn arrow_select_sql(batch_count: usize) -> String {
+    let mut queries = std::iter::repeat_n("SELECT * FROM arrow(?, ?)".to_string(), batch_count)
+        .collect::<Vec<_>>();
+
+    while queries.len() > 1 {
+        let mut combined = Vec::with_capacity(queries.len().div_ceil(2));
+        let mut iter = queries.into_iter();
+
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                combined.push(format!(
+                    "SELECT * FROM ({left}) AS __arroyo_left UNION ALL SELECT * FROM ({right}) AS __arroyo_right"
+                ));
+            } else {
+                combined.push(left);
+            }
+        }
+
+        queries = combined;
+    }
+
+    queries.pop().unwrap_or_default()
+}
+
+fn arrow_params(batches: &[RecordBatch]) -> Vec<usize> {
+    batches
+        .iter()
+        .flat_map(|batch| arrow_recordbatch_to_query_params(batch.clone()))
+        .collect()
+}
+
 fn run_duckdb_query(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     let conn = Connection::open_in_memory()?;
     conn.register_table_function::<ArrowVTab>("arrow")?;
-
-    let mut create = conn.prepare("CREATE TEMP TABLE events AS SELECT * FROM arrow(?, ?)")?;
-    create.execute(arrow_recordbatch_to_query_params(batches[0].clone()))?;
-
-    let mut insert = conn.prepare("INSERT INTO events SELECT * FROM arrow(?, ?)")?;
-    for batch in &batches[1..] {
-        insert.execute(arrow_recordbatch_to_query_params(batch.clone()))?;
-    }
-
-    let mut stmt = conn.prepare(QUERY)?;
-    Ok(stmt.query_arrow([])?.collect())
+    let max_expression_depth = (batches.len() * 4).max(1_000);
+    conn.execute(
+        &format!("SET max_expression_depth TO {max_expression_depth}"),
+        [],
+    )?;
+    let query_sql = format!(
+        "WITH events AS ({}) {}",
+        arrow_select_sql(batches.len()),
+        QUERY
+    );
+    let mut stmt = conn.prepare(&query_sql)?;
+    Ok(stmt
+        .query_arrow(params_from_iter(arrow_params(batches)))?
+        .collect())
 }
 
 async fn run_datafusion_query(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {

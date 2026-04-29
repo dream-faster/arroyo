@@ -19,6 +19,7 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
 use datafusion_proto::protobuf::PhysicalExprNode;
 use duckdb::Connection;
+use duckdb::params_from_iter;
 use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
 use futures::StreamExt;
 use prost::Message;
@@ -70,8 +71,9 @@ impl DuckdbTumblingWindowFunc {
         from_nanos(aligned)
     }
 
-    /// Execute `self.sql_query` inside an in-memory DuckDB instance against `batches`, then append
-    /// a `_timestamp` column populated with `bin_start_nanos`.
+    /// Execute `self.sql_query` inside an in-memory DuckDB instance against `batches` exposed
+    /// through an Arrow-backed temp view, then append a `_timestamp` column populated with
+    /// `bin_start_nanos`.
     fn execute_on_batches(
         &self,
         batches: &[RecordBatch],
@@ -83,31 +85,14 @@ impl DuckdbTumblingWindowFunc {
 
         let conn = Connection::open_in_memory()?;
         conn.register_table_function::<duckdb::vtab::arrow::ArrowVTab>("arrow")?;
+        configure_duckdb_for_arrow_union(&conn, batches.len())?;
 
-        // Register the first batch to create the temp table
-        let first = &batches[0];
-        let create_sql = format!(
-            "CREATE TEMP TABLE {} AS SELECT * FROM arrow(?, ?)",
-            quote_ident(&self.input_table_name)
-        );
-        let mut stmt = conn.prepare(&create_sql)?;
-        stmt.execute(arrow_recordbatch_to_query_params(first.clone()))?;
-
-        // Insert remaining batches
-        if batches.len() > 1 {
-            let insert_sql = format!(
-                "INSERT INTO {} SELECT * FROM arrow(?, ?)",
-                quote_ident(&self.input_table_name)
-            );
-            for batch in &batches[1..] {
-                let mut stmt = conn.prepare(&insert_sql)?;
-                stmt.execute(arrow_recordbatch_to_query_params(batch.clone()))?;
-            }
-        }
-
-        // Run the user query
-        let mut stmt = conn.prepare(&self.sql_query)?;
-        let result_batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
+        let query_sql =
+            query_over_arrow_input(&self.sql_query, &self.input_table_name, batches.len())?;
+        let mut stmt = conn.prepare(&query_sql)?;
+        let result_batches: Vec<RecordBatch> = stmt
+            .query_arrow(params_from_iter(arrow_params(batches)))?
+            .collect();
 
         // Append `_timestamp` = bin_start to each result batch
         let bin_ts = ScalarValue::TimestampNanosecond(Some(to_nanos(bin_start) as i64), None);
@@ -120,6 +105,65 @@ impl DuckdbTumblingWindowFunc {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn arrow_params(batches: &[RecordBatch]) -> Vec<usize> {
+    batches
+        .iter()
+        .flat_map(|batch| arrow_recordbatch_to_query_params(batch.clone()))
+        .collect()
+}
+
+fn arrow_select_sql(batch_count: usize) -> String {
+    let mut queries = std::iter::repeat_n("SELECT * FROM arrow(?, ?)".to_string(), batch_count)
+        .collect::<Vec<_>>();
+
+    while queries.len() > 1 {
+        let mut combined = Vec::with_capacity(queries.len().div_ceil(2));
+        let mut iter = queries.into_iter();
+
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                combined.push(format!(
+                    "SELECT * FROM ({left}) AS __arroyo_left UNION ALL SELECT * FROM ({right}) AS __arroyo_right"
+                ));
+            } else {
+                combined.push(left);
+            }
+        }
+
+        queries = combined;
+    }
+
+    queries.pop().unwrap_or_default()
+}
+
+fn query_over_arrow_input(
+    sql_query: &str,
+    input_table_name: &str,
+    batch_count: usize,
+) -> Result<String> {
+    if sql_query.trim_start().starts_with("WITH ") {
+        return Err(anyhow!(
+            "DuckDB Arrow scan wrapper does not yet support queries starting with WITH"
+        ));
+    }
+
+    Ok(format!(
+        "WITH {} AS ({}) {}",
+        quote_ident(input_table_name),
+        arrow_select_sql(batch_count),
+        sql_query
+    ))
+}
+
+fn configure_duckdb_for_arrow_union(conn: &Connection, batch_count: usize) -> Result<()> {
+    let max_expression_depth = (batch_count * 4).max(1_000);
+    conn.execute(
+        &format!("SET max_expression_depth TO {max_expression_depth}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn append_timestamp(
@@ -207,16 +251,16 @@ impl OperatorConstructor for DuckdbTumblingWindowConstructor {
     }
 }
 
-/// Derive the schema that the SQL query will produce by executing it against a zero-row table with
-/// the correct schema.
+/// Derive the schema that the SQL query will produce by executing it against a zero-row Arrow-backed
+/// view with the correct schema.
 fn derive_result_schema(
     input_schema: &Arc<Schema>,
     sql_query: &str,
     input_table_name: &str,
 ) -> Result<Arc<Schema>> {
-    use duckdb::vtab::arrow::ArrowVTab;
     let conn = Connection::open_in_memory()?;
-    conn.register_table_function::<ArrowVTab>("arrow")?;
+    conn.register_table_function::<duckdb::vtab::arrow::ArrowVTab>("arrow")?;
+    configure_duckdb_for_arrow_union(&conn, 1)?;
 
     // Build zero-row batch matching the input schema by creating empty arrays of each type
     let empty_arrays: Vec<Arc<dyn Array>> = input_schema
@@ -227,17 +271,12 @@ fn derive_result_schema(
     let empty_batch = RecordBatch::try_new(input_schema.clone(), empty_arrays)
         .map_err(|e| anyhow!("failed to create empty batch: {e}"))?;
 
-    let create_sql = format!(
-        "CREATE TEMP TABLE {} AS SELECT * FROM arrow(?, ?)",
-        quote_ident(input_table_name)
-    );
-    conn.prepare(&create_sql)?
-        .execute(arrow_recordbatch_to_query_params(empty_batch))?;
+    let query_sql = query_over_arrow_input(sql_query, input_table_name, 1)?;
 
     // Use `schema()` from `RecordBatchReader` – this gives the output schema from query metadata
     // even when the query returns 0 rows (e.g., GROUP BY on empty input).
-    let mut stmt = conn.prepare(sql_query)?;
-    let arrow_result = stmt.query_arrow([])?;
+    let mut stmt = conn.prepare(&query_sql)?;
+    let arrow_result = stmt.query_arrow(arrow_recordbatch_to_query_params(empty_batch))?;
     Ok(arrow_result.get_schema())
 }
 
