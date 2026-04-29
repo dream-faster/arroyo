@@ -4,11 +4,11 @@ use typify::import_types;
 
 use arroyo_formats::ser::ArrowSerializer;
 use arroyo_operator::connector::Connection;
-use arroyo_rpc::api_types::connections::{ConnectionProfile, TestSourceMessage};
+use arroyo_rpc::api_types::connections::{ConnectionProfile, ConnectionSchema, TestSourceMessage};
 use arroyo_rpc::{ConnectorOptions, OperatorConfig, api_types};
 use serde::{Deserialize, Serialize};
 
-use crate::{ConnectionSchema, ConnectionType, EmptyConfig};
+use crate::{ConnectionType, EmptyConfig};
 
 use crate::kinesis::sink::{FlushConfig, KinesisSinkFunc};
 use crate::kinesis::source::KinesisSourceFunc;
@@ -95,13 +95,12 @@ impl Connector for KinesisConnector {
             ),
         };
         let schema = schema
-            .map(|s| s.to_owned())
+            .cloned()
             .ok_or_else(|| anyhow!("No schema defined for Kinesis"))?;
 
         let format = schema
             .format
-            .as_ref()
-            .map(|format| format.to_owned())
+            .clone()
             .ok_or_else(|| anyhow!("'format' must be set for kinesis connections"))?;
 
         let config = OperatorConfig {

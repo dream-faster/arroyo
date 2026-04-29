@@ -5,6 +5,8 @@ use itertools::Itertools;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::sync::Arc;
 
+pub type SchemaRef = iceberg::spec::SchemaRef;
+
 /// Add metadata "PARQUET:field_id" to every field , which is required by the arrow -> iceberg
 /// schema conversion code from iceberg-rust
 pub fn add_parquet_field_ids(schema: &Schema) -> Schema {

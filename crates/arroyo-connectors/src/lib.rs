@@ -67,6 +67,14 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
 #[derive(Serialize, Deserialize)]
 pub struct EmptyConfig {}
 
+#[cfg(feature = "kafka")]
+pub(crate) async fn send(
+    tx: &mut tokio::sync::mpsc::Sender<arroyo_rpc::api_types::connections::TestSourceMessage>,
+    message: arroyo_rpc::api_types::connections::TestSourceMessage,
+) {
+    tx.send(message).await.unwrap();
+}
+
 pub fn connector_for_type(t: &str) -> Option<Box<dyn ErasedConnector>> {
     connectors().remove(t)
 }
