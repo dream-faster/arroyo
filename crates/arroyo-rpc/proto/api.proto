@@ -71,9 +71,10 @@ message SessionWindowAggregateOperator {
 }
 
 message AsofJoinConfig {
-  // Index of the left timestamp column in the keyed left schema.
+  // Index of the left timestamp column in the (unkeyed) left input schema —
+  // i.e., the same field ordering produced by `ArroyoSchema::unkeyed_batch`.
   uint32 left_ts_index = 1;
-  // Index of the right timestamp column in the keyed right schema.
+  // Index of the right timestamp column in the (unkeyed) right input schema.
   uint32 right_ts_index = 2;
 }
 

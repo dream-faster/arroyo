@@ -462,3 +462,86 @@ fn pick_asof_right(
     }
     Ok(best.map(|(i, _)| i))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow_array::{Int64Array, TimestampNanosecondArray};
+
+    fn ts_batch(values: Vec<Option<i64>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        ]));
+        let v = Arc::new(Int64Array::from(
+            (0..values.len() as i64).collect::<Vec<_>>(),
+        ));
+        let t = Arc::new(TimestampNanosecondArray::from(values));
+        RecordBatch::try_new(schema, vec![v, t]).unwrap()
+    }
+
+    #[test]
+    fn pick_asof_right_returns_largest_le_left_ts() {
+        let batch = ts_batch(vec![Some(10), Some(20), Some(30), Some(40)]);
+        // left_ts = 25 → best index is 1 (value 20)
+        assert_eq!(pick_asof_right(&batch, 1, 25).unwrap(), Some(1));
+        // left_ts = 40 → best is the largest <= 40 (index 3)
+        assert_eq!(pick_asof_right(&batch, 1, 40).unwrap(), Some(3));
+        // left_ts = 5 → no candidate
+        assert_eq!(pick_asof_right(&batch, 1, 5).unwrap(), None);
+    }
+
+    #[test]
+    fn pick_asof_right_skips_nulls() {
+        let batch = ts_batch(vec![None, Some(10), None, Some(20), None]);
+        assert_eq!(pick_asof_right(&batch, 1, 15).unwrap(), Some(1));
+        assert_eq!(pick_asof_right(&batch, 1, 25).unwrap(), Some(3));
+        // All-null candidates → None
+        let null_batch = ts_batch(vec![None, None, None]);
+        assert_eq!(pick_asof_right(&null_batch, 1, 100).unwrap(), None);
+    }
+
+    #[test]
+    fn pick_asof_right_picks_first_when_tied_on_max() {
+        // Two rows tie on the same max value <= left_ts. The kernel must
+        // return one (current implementation prefers the earlier index).
+        let batch = ts_batch(vec![Some(10), Some(10), Some(5)]);
+        let got = pick_asof_right(&batch, 1, 12).unwrap();
+        assert!(got == Some(0) || got == Some(1));
+    }
+
+    #[test]
+    fn pick_asof_right_rejects_non_timestamp_column() {
+        // Column 0 is Int64, not Timestamp → kernel must error out.
+        let batch = ts_batch(vec![Some(1)]);
+        let err = pick_asof_right(&batch, 0, 0).unwrap_err().to_string();
+        assert!(
+            err.contains("Timestamp"),
+            "expected Timestamp type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ts_value_reads_first_row() {
+        let batch = ts_batch(vec![Some(123), Some(456)]);
+        assert_eq!(ts_value(&batch, 1).unwrap(), 123);
+    }
+
+    #[test]
+    fn ts_value_errors_on_null() {
+        let batch = ts_batch(vec![None]);
+        let err = ts_value(&batch, 1).unwrap_err().to_string();
+        assert!(err.contains("NULL"), "expected NULL error, got: {err}");
+    }
+
+    #[test]
+    fn ts_value_errors_on_wrong_type() {
+        let batch = ts_batch(vec![Some(1)]);
+        let err = ts_value(&batch, 0).unwrap_err().to_string();
+        assert!(
+            err.contains("Timestamp"),
+            "expected Timestamp type error, got: {err}"
+        );
+    }
+}

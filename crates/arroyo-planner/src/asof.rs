@@ -20,7 +20,9 @@
 //!    the inner-join physical plan.
 //!
 //! Restrictions: inner join only, exactly one inequality in the
-//! `MATCH_CONDITION`, no other filter conditions.
+//! `MATCH_CONDITION` (must be `>=`). Additional non-marker filter conditions
+//! in the ON clause beyond the match condition and equi-conditions are
+//! preserved and pushed through to the underlying DataFusion inner join.
 
 use sqlparser::ast::{
     BinaryOperator, Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
@@ -188,4 +190,127 @@ fn make_marker_call(lhs: Expr, rhs: Expr) -> Expr {
         over: None,
         within_group: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::ArroyoDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse(sql: &str) -> Vec<Statement> {
+        Parser::parse_sql(&ArroyoDialect {}, sql).unwrap()
+    }
+
+    fn rewrite(sql: &str) -> Result<Vec<Statement>, ParserError> {
+        let mut stmts = parse(sql);
+        rewrite_asof_joins(&mut stmts)?;
+        Ok(stmts)
+    }
+
+    /// Render each statement back to SQL — this is a stable way to assert the
+    /// rewriter produced the structure we expect.
+    fn rendered(stmts: &[Statement]) -> String {
+        stmts
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn rewrites_basic_asof_to_inner_with_marker() {
+        let sql = "SELECT * FROM left_t l ASOF JOIN right_t r \
+                   MATCH_CONDITION (l.ts >= r.ts) ON l.k = r.k";
+        let out = rewrite(sql).unwrap();
+        let s = rendered(&out);
+        assert!(
+            s.to_uppercase().contains("INNER JOIN") || s.to_uppercase().contains("JOIN"),
+            "expected an inner join in the rewrite, got {s}"
+        );
+        assert!(
+            !s.to_uppercase().contains("ASOF JOIN"),
+            "expected `ASOF JOIN` syntax to be removed, got {s}"
+        );
+        assert!(
+            s.contains(ASOF_MARKER_UDF),
+            "expected `{ASOF_MARKER_UDF}` marker call, got {s}"
+        );
+        // The original equi- and match-conditions must still be present.
+        assert!(s.contains("l.k = r.k"), "got {s}");
+        assert!(s.contains("l.ts >= r.ts"), "got {s}");
+    }
+
+    #[test]
+    fn rejects_non_gteq_match_condition() {
+        // `>` is not allowed for v1 — only `>=`.
+        let err = rewrite("SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts > r.ts) ON l.k = r.k")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`>=`"),
+            "expected error to mention `>=` requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_inequality_match_condition() {
+        // A boolean column reference is not a `>=` comparison.
+        let err = rewrite("SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.flag) ON l.k = r.k")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("MATCH_CONDITION"),
+            "expected MATCH_CONDITION error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rewrites_asof_inside_cte_and_subquery() {
+        // The rewriter must descend into CTEs and derived subqueries.
+        let sql = "WITH q AS (\
+                     SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts >= r.ts) ON l.k = r.k\
+                   ) \
+                   SELECT * FROM q";
+        let out = rewrite(sql).unwrap();
+        let s = rendered(&out);
+        assert!(
+            s.contains(ASOF_MARKER_UDF) && !s.to_uppercase().contains("ASOF JOIN"),
+            "expected CTE ASOF to be rewritten, got: {s}"
+        );
+
+        let sql2 = "SELECT * FROM (\
+                      SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts >= r.ts) ON l.k = r.k\
+                    ) sub";
+        let out2 = rewrite(sql2).unwrap();
+        let s2 = rendered(&out2);
+        assert!(
+            s2.contains(ASOF_MARKER_UDF) && !s2.to_uppercase().contains("ASOF JOIN"),
+            "expected subquery ASOF to be rewritten, got: {s2}"
+        );
+    }
+
+    #[test]
+    fn leaves_plain_inner_joins_untouched() {
+        let sql = "SELECT * FROM l JOIN r ON l.k = r.k";
+        let out = rewrite(sql).unwrap();
+        let s = rendered(&out);
+        assert!(
+            !s.contains(ASOF_MARKER_UDF),
+            "non-ASOF joins must not get a marker, got: {s}"
+        );
+    }
+
+    #[test]
+    fn rejects_asof_without_on() {
+        // The Arroyo dialect requires an ON clause for ASOF (we surface a
+        // clear error rather than silently dropping it).
+        let err = rewrite("SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts >= r.ts)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_uppercase().contains("ON"),
+            "expected error to mention ON clause, got: {err}"
+        );
+    }
 }
