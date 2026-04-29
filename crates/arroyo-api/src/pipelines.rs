@@ -56,15 +56,15 @@ use petgraph::prelude::EdgeRef;
 #[cfg(feature = "kafka")]
 use arrow_schema::SchemaRef;
 #[cfg(feature = "kafka")]
+use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
+#[cfg(feature = "kafka")]
 use arroyo_formats::ser::ArrowSerializer;
 #[cfg(feature = "kafka")]
-use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
+use arroyo_rpc::OperatorConfig;
 #[cfg(feature = "kafka")]
 use arroyo_rpc::formats::Format;
 #[cfg(feature = "kafka")]
 use arroyo_rpc::schema_resolver::{ConfluentSchemaRegistry, ConfluentSchemaType};
-#[cfg(feature = "kafka")]
-use arroyo_rpc::OperatorConfig;
 
 async fn compile_sql(
     query: String,
