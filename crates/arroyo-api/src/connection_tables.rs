@@ -13,9 +13,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
-use arroyo_connectors::confluent::ConfluentProfile;
 use arroyo_connectors::connector_for_type;
-use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
 use arroyo_formats::{avro, json, proto};
 use arroyo_operator::connector::ErasedConnector;
 use arroyo_rpc::api_types::connections::{
@@ -28,6 +26,11 @@ use arroyo_rpc::public_ids::{IdTypes, generate_id};
 use arroyo_rpc::schema_resolver::{
     ConfluentSchemaRegistry, ConfluentSchemaSubjectResponse, ConfluentSchemaType,
 };
+
+#[cfg(feature = "kafka")]
+use arroyo_connectors::confluent::ConfluentProfile;
+#[cfg(feature = "kafka")]
+use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
 
 use crate::rest::AppState;
 use crate::rest_utils::{
@@ -731,6 +734,7 @@ async fn expand_json_schema(
     Ok(schema)
 }
 
+#[cfg(feature = "kafka")]
 async fn get_schema(
     connector: &str,
     table_config: &Value,
@@ -800,6 +804,28 @@ async fn get_schema(
         .map_err(|e| bad_request(e.to_string()))?;
 
     Ok(Some((resp, references)))
+}
+
+#[cfg(not(feature = "kafka"))]
+async fn get_schema(
+    connector: &str,
+    _table_config: &Value,
+    _profile_config: &Value,
+) -> Result<
+    Option<(
+        ConfluentSchemaSubjectResponse,
+        Vec<(String, ConfluentSchemaSubjectResponse)>,
+    )>,
+    ErrorResp,
+> {
+    match connector {
+        "kafka" | "confluent" => Err(bad_request(
+            "Kafka and Confluent connectors are not enabled in this build",
+        )),
+        _ => Err(bad_request(
+            "confluent schema registry can only be used for Kafka or Confluent connections",
+        )),
+    }
 }
 
 /// Test a Connection Schema
