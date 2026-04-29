@@ -57,7 +57,7 @@ rustls023 = { package = "rustls", version = "0.23.27" }
 eventsource-client = "0.13.0"
 
 # Websocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 
 # Webhook
 reqwest = { workspace = true, features = ["stream"] }

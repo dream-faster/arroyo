@@ -8,7 +8,7 @@ ARG PROFILE=release
 ARG FEATURES=
 
 RUN apt-get update && \
-    apt-get -y install curl pkg-config unzip build-essential libssl-dev openssl \
+    apt-get -y install curl pkg-config unzip build-essential \
     cmake clang wget postgresql postgresql-client supervisor sudo bash libsasl2-dev && \
     cargo install refinery_cli
 
