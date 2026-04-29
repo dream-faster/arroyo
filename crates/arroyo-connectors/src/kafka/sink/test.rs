@@ -222,3 +222,32 @@ async fn test_kafka() {
         assert_eq!(message, result.value);
     }
 }
+
+#[test]
+fn test_select_partition_is_deterministic_for_keys() {
+    let mut producer = super::KafkaProducer {
+        partition_ids: vec![1, 4, 7],
+        partition_clients: HashMap::new(),
+        next_partition: 0,
+    };
+
+    let first = producer.select_partition(Some(b"stable-key"));
+    let second = producer.select_partition(Some(b"stable-key"));
+
+    assert_eq!(first, second);
+    assert!(matches!(first, 1 | 4 | 7));
+}
+
+#[test]
+fn test_round_robin_uses_sorted_partition_ids() {
+    let mut producer = super::KafkaProducer {
+        partition_ids: vec![2, 5, 9],
+        partition_clients: HashMap::new(),
+        next_partition: 0,
+    };
+
+    assert_eq!(producer.select_partition(None), 2);
+    assert_eq!(producer.select_partition(None), 5);
+    assert_eq!(producer.select_partition(None), 9);
+    assert_eq!(producer.select_partition(None), 2);
+}

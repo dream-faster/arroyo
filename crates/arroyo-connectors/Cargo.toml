@@ -50,7 +50,7 @@ sha2 = "0.10"
 
 # Kafka
 aws-msk-iam-sasl-signer = "1.0.0"
-rskafka = { git = "https://github.com/influxdata/rskafka", features = ["transport-tls"] }
+rskafka = { git = "https://github.com/influxdata/rskafka", rev = "9e0dad678abac7c70a7873812bbcce1ede1563a2", features = ["transport-tls"] }
 rustls023 = { package = "rustls", version = "0.23.27" }
 
 # SSE

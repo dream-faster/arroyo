@@ -216,7 +216,17 @@ impl KafkaSourceFunc {
                         Some(Err(err)) => {
                             error!("encountered error {}", err);
                         }
-                        None => {}
+                        None => {
+                            error!(
+                                "all Kafka partition consumer tasks exited; records channel closed unexpectedly"
+                            );
+                            return Err(
+                                anyhow::anyhow!(
+                                    "Kafka source records channel closed unexpectedly"
+                                )
+                                .into(),
+                            );
+                        }
                     }
                 }
                 _ = flush_ticker.tick() => {

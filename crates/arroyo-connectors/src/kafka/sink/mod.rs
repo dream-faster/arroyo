@@ -7,7 +7,6 @@ use arroyo_rpc::{CheckpointEvent, ControlResp};
 use arroyo_types::*;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
 use tracing::warn;
 
 use arrow::array::{Array, AsArray, RecordBatch};
@@ -47,7 +46,8 @@ pub struct KafkaSinkFunc {
 
 #[derive(Debug)]
 pub struct KafkaProducer {
-    partition_clients: Vec<Arc<PartitionClient>>,
+    partition_ids: Vec<i32>,
+    partition_clients: HashMap<i32, Arc<PartitionClient>>,
     next_partition: usize,
 }
 
@@ -131,15 +131,24 @@ impl KafkaSinkFunc {
         let metadata = topic_metadata(&client, &self.topic)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Kafka topic '{}' does not exist", self.topic))?;
-        let mut partition_clients = Vec::with_capacity(metadata.partitions.len());
-        for partition in metadata.partitions {
-            partition_clients.push(partition_client(&client, &self.topic, partition).await?);
+        let mut partitions = metadata.partitions;
+        partitions.sort_unstable();
+
+        let mut partition_ids = Vec::with_capacity(partitions.len());
+        let mut partition_clients = HashMap::with_capacity(partitions.len());
+        for partition in partitions {
+            partition_ids.push(partition);
+            partition_clients.insert(
+                partition,
+                partition_client(&client, &self.topic, partition).await?,
+            );
         }
-        if partition_clients.is_empty() {
+        if partition_ids.is_empty() {
             bail!("Kafka topic '{}' has no partitions", self.topic);
         }
 
         self.producer = Some(KafkaProducer {
+            partition_ids,
             partition_clients,
             next_partition: task_info.task_index as usize,
         });
@@ -169,7 +178,7 @@ impl KafkaSinkFunc {
             .producer
             .as_mut()
             .expect("Kafka producer not initialized");
-        let mut by_partition: HashMap<usize, Vec<rskafka::record::Record>> = HashMap::new();
+        let mut by_partition: HashMap<i32, Vec<rskafka::record::Record>> = HashMap::new();
 
         for (index, value) in values.enumerate() {
             let timestamp = timestamps.map(|ts| {
@@ -188,8 +197,7 @@ impl KafkaSinkFunc {
         }
 
         for (partition, records) in by_partition {
-            if let Err(error) =
-                produce_records(&producer.partition_clients[partition], records).await
+            if let Err(error) = produce_records(producer.partition_client(partition), records).await
             {
                 ctx.error_reporter
                     .report_error("Could not write to Kafka", error.to_string())
@@ -203,20 +211,76 @@ impl KafkaSinkFunc {
 }
 
 impl KafkaProducer {
-    fn select_partition(&mut self, key: Option<&[u8]>) -> usize {
+    fn select_partition(&mut self, key: Option<&[u8]>) -> i32 {
         match key {
-            Some(key) => {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hasher);
-                (hasher.finish() as usize) % self.partition_clients.len()
-            }
-            None => {
-                let partition = self.next_partition % self.partition_clients.len();
-                self.next_partition = (self.next_partition + 1) % self.partition_clients.len();
-                partition
-            }
+            Some(key) => self.partition_ids[kafka_partition_index(key, self.partition_ids.len())],
+            None => self.next_round_robin_partition(),
         }
     }
+
+    fn next_round_robin_partition(&mut self) -> i32 {
+        let partition = self.partition_ids[self.next_partition % self.partition_ids.len()];
+        self.next_partition = (self.next_partition + 1) % self.partition_ids.len();
+        partition
+    }
+
+    fn partition_client(&self, partition: i32) -> &Arc<PartitionClient> {
+        self.partition_clients
+            .get(&partition)
+            .expect("selected Kafka partition is not initialized")
+    }
+}
+
+fn kafka_partition_index(key: &[u8], partition_count: usize) -> usize {
+    (to_positive(kafka_murmur2(key)) as usize) % partition_count
+}
+
+fn to_positive(value: u32) -> u32 {
+    value & 0x7fff_ffff
+}
+
+fn kafka_murmur2(data: &[u8]) -> u32 {
+    const SEED: u32 = 0x9747_b28c;
+    const M: u32 = 0x5bd1_e995;
+    const R: u32 = 24;
+
+    let len = data.len() as u32;
+    let mut h = SEED ^ len;
+    let mut i = 0;
+
+    while i + 4 <= data.len() {
+        let mut k = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        k = k.wrapping_mul(M);
+        k ^= k >> R;
+        k = k.wrapping_mul(M);
+        h = h.wrapping_mul(M);
+        h ^= k;
+        i += 4;
+    }
+
+    match data.len() - i {
+        3 => {
+            h ^= (data[i + 2] as u32) << 16;
+            h ^= (data[i + 1] as u32) << 8;
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        2 => {
+            h ^= (data[i + 1] as u32) << 8;
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        1 => {
+            h ^= data[i] as u32;
+            h = h.wrapping_mul(M);
+        }
+        _ => {}
+    }
+
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    h ^= h >> 15;
+    h
 }
 
 #[async_trait]
