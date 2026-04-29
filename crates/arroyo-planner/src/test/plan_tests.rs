@@ -19,7 +19,9 @@ fn for_each_file(#[files("src/test/queries/*.sql")] path: PathBuf) {
 async fn validate_query(path: &Path) {
     let query = tokio::fs::read_to_string(path).await.unwrap();
 
-    if !cfg!(feature = "kafka") && query.contains("connector = 'kafka'") {
+    if (!cfg!(feature = "kafka") && query.contains("connector = 'kafka'"))
+        || (!cfg!(feature = "iceberg") && query.contains("connector = 'iceberg'"))
+    {
         return;
     }
 
