@@ -26,10 +26,6 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 use uuid::Uuid;
 pub mod arrow;
-#[cfg(feature = "iceberg")]
-#[path = "iceberg/mod.rs"]
-pub(crate) mod iceberg;
-#[cfg(not(feature = "iceberg"))]
 #[path = "iceberg_disabled.rs"]
 pub(crate) mod iceberg;
 pub mod json;

@@ -17,8 +17,6 @@ pub mod confluent;
 pub mod filesystem;
 pub mod impulse;
 pub mod kafka;
-#[cfg(feature = "kinesis")]
-pub mod kinesis;
 pub mod mqtt;
 pub mod nats;
 pub mod nexmark;
@@ -37,12 +35,8 @@ pub fn connectors() -> HashMap<&'static str, Box<dyn ErasedConnector>> {
         Box::new(blackhole::BlackholeConnector {}),
         Box::new(confluent::ConfluentConnector {}),
         Box::new(filesystem::FileSystemConnector {}),
-        #[cfg(feature = "iceberg")]
-        Box::new(filesystem::iceberg::IcebergConnector {}),
         Box::new(impulse::ImpulseConnector {}),
         Box::new(kafka::KafkaConnector {}),
-        #[cfg(feature = "kinesis")]
-        Box::new(kinesis::KinesisConnector {}),
         Box::new(mqtt::MqttConnector {}),
         Box::new(nats::NatsConnector {}),
         Box::new(nexmark::NexmarkConnector {}),
@@ -206,18 +200,12 @@ mod test {
     }
 
     #[test]
-    fn optional_connectors_follow_feature_flags() {
+    fn removed_connectors_are_not_registered() {
         let connectors = connectors();
 
         assert!(connectors.contains_key("confluent"));
         assert!(connectors.contains_key("kafka"));
-        assert_eq!(
-            connectors.contains_key("iceberg"),
-            cfg!(feature = "iceberg")
-        );
-        assert_eq!(
-            connectors.contains_key("kinesis"),
-            cfg!(feature = "kinesis")
-        );
+        assert!(!connectors.contains_key("iceberg"));
+        assert!(!connectors.contains_key("kinesis"));
     }
 }

@@ -40,8 +40,8 @@ pub mod metadata {
         DataflowError::ConnectorError {
             domain: ErrorDomain::User,
             retry: RetryHint::NoRetry,
-            error: "iceberg support is disabled; rebuild with --features iceberg".to_string(),
-            source: Some(anyhow!("iceberg feature disabled")),
+            error: "iceberg support has been removed".to_string(),
+            source: Some(anyhow!("iceberg support removed")),
         }
     }
 
@@ -77,10 +77,6 @@ pub mod schema {
         Ok(batch.clone())
     }
 }
-
-#[allow(dead_code)]
-#[path = "iceberg/transforms.rs"]
-pub mod transforms;
 
 use crate::filesystem::config::{IcebergCatalog, IcebergSink};
 use crate::filesystem::sink::FinishedFile;
