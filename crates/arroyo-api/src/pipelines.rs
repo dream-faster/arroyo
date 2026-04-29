@@ -25,12 +25,10 @@ use arroyo_rpc::grpc::api::{ArrowProgram, ConnectorOp};
 use arroyo_datastream::logical::{
     ChainedLogicalOperator, LogicalNode, LogicalProgram, OperatorChain, OperatorName,
 };
-use arroyo_formats::ser::ArrowSerializer;
 use arroyo_planner::{ArroyoSchemaProvider, CompiledSql, SqlConfig};
-use arroyo_rpc::formats::Format;
 use arroyo_rpc::grpc::rpc::compiler_grpc_client::CompilerGrpcClient;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
-use arroyo_rpc::{OperatorConfig, error_chain, log_event};
+use arroyo_rpc::{error_chain, log_event};
 use arroyo_udf_host::ParsedUdfFile;
 use prost::Message;
 use serde_json::json;
@@ -58,9 +56,15 @@ use petgraph::prelude::EdgeRef;
 #[cfg(feature = "kafka")]
 use arrow_schema::SchemaRef;
 #[cfg(feature = "kafka")]
+use arroyo_formats::ser::ArrowSerializer;
+#[cfg(feature = "kafka")]
 use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
 #[cfg(feature = "kafka")]
+use arroyo_rpc::formats::Format;
+#[cfg(feature = "kafka")]
 use arroyo_rpc::schema_resolver::{ConfluentSchemaRegistry, ConfluentSchemaType};
+#[cfg(feature = "kafka")]
+use arroyo_rpc::OperatorConfig;
 
 async fn compile_sql(
     query: String,

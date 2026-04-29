@@ -23,14 +23,14 @@ use arroyo_rpc::api_types::connections::{
 use arroyo_rpc::api_types::{ConnectionTableCollection, PaginationQueryParams};
 use arroyo_rpc::formats::{AvroFormat, Format, JsonFormat, ProtobufFormat};
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
-use arroyo_rpc::schema_resolver::{
-    ConfluentSchemaRegistry, ConfluentSchemaSubjectResponse, ConfluentSchemaType,
-};
+use arroyo_rpc::schema_resolver::{ConfluentSchemaSubjectResponse, ConfluentSchemaType};
 
 #[cfg(feature = "kafka")]
 use arroyo_connectors::confluent::ConfluentProfile;
 #[cfg(feature = "kafka")]
 use arroyo_connectors::kafka::{KafkaConfig, KafkaTable, SchemaRegistry};
+#[cfg(feature = "kafka")]
+use arroyo_rpc::schema_resolver::ConfluentSchemaRegistry;
 
 use crate::rest::AppState;
 use crate::rest_utils::{
