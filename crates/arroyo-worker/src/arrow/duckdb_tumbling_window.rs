@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use arrow::compute::{partition, sort_to_indices, take};
+use arrow::compute::{concat_batches, partition, sort_to_indices, take};
 use arrow_array::{Array, PrimitiveArray, RecordBatch, types::TimestampNanosecondType};
 use arrow_schema::{Schema, SchemaRef};
 use arroyo_operator::context::{Collector, OperatorContext};
@@ -34,6 +34,8 @@ use arroyo_rpc::df::ArroyoSchema;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::protobuf::PhysicalPlanNode;
+
+const DUCKDB_TARGET_BATCH_ROWS: usize = 2_048;
 
 /// Per-bin accumulated state: just the raw input `RecordBatch`es that arrived during the window.
 #[derive(Default)]
@@ -82,16 +84,20 @@ impl DuckdbTumblingWindowFunc {
         if batches.is_empty() {
             return Ok(vec![]);
         }
+        let compacted_batches = compact_batches(batches, DUCKDB_TARGET_BATCH_ROWS)?;
 
         let conn = Connection::open_in_memory()?;
         conn.register_table_function::<duckdb::vtab::arrow::ArrowVTab>("arrow")?;
-        configure_duckdb_for_arrow_union(&conn, batches.len())?;
+        configure_duckdb_for_arrow_union(&conn, compacted_batches.len())?;
 
-        let query_sql =
-            query_over_arrow_input(&self.sql_query, &self.input_table_name, batches.len())?;
+        let query_sql = query_over_arrow_input(
+            &self.sql_query,
+            &self.input_table_name,
+            compacted_batches.len(),
+        )?;
         let mut stmt = conn.prepare(&query_sql)?;
         let result_batches: Vec<RecordBatch> = stmt
-            .query_arrow(params_from_iter(arrow_params(batches)))?
+            .query_arrow(params_from_iter(arrow_params(&compacted_batches)))?
             .collect();
 
         // Append `_timestamp` = bin_start to each result batch
@@ -105,6 +111,43 @@ impl DuckdbTumblingWindowFunc {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn compact_batches(batches: &[RecordBatch], target_rows: usize) -> Result<Vec<RecordBatch>> {
+    if batches.len() <= 1 {
+        return Ok(batches.to_vec());
+    }
+
+    let schema = batches[0].schema();
+    let mut compacted = Vec::new();
+    let mut pending = Vec::new();
+    let mut pending_rows = 0;
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        if pending.is_empty() && batch.num_rows() >= target_rows {
+            compacted.push(batch.clone());
+            continue;
+        }
+
+        pending.push(batch);
+        pending_rows += batch.num_rows();
+
+        if pending_rows >= target_rows {
+            compacted.push(concat_batches(&schema, pending.iter().copied())?);
+            pending.clear();
+            pending_rows = 0;
+        }
+    }
+
+    if !pending.is_empty() {
+        compacted.push(concat_batches(&schema, pending.iter().copied())?);
+    }
+
+    Ok(compacted)
 }
 
 fn arrow_params(batches: &[RecordBatch]) -> Vec<usize> {
@@ -664,6 +707,21 @@ mod tests {
 
         let ts = UNIX_EPOCH + Duration::from_secs(7200);
         assert_eq!(wf.bin_start(ts), ts);
+    }
+
+    #[test]
+    fn compact_batches_coalesces_small_inputs() {
+        let schema = build_events_schema();
+        let batches = vec![
+            make_batch(schema.clone(), vec![ts_ns(0)], vec!["a"], vec![1]),
+            make_batch(schema.clone(), vec![ts_ns(1)], vec!["b"], vec![2]),
+            make_batch(schema.clone(), vec![ts_ns(2)], vec!["c"], vec![3]),
+        ];
+
+        let compacted = compact_batches(&batches, 2).unwrap();
+        assert_eq!(compacted.len(), 2);
+        assert_eq!(compacted[0].num_rows(), 2);
+        assert_eq!(compacted[1].num_rows(), 1);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use arrow::compute::concat_batches;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{Int64Array, RecordBatch, StringArray, TimestampNanosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -15,6 +16,7 @@ const QUERY: &str = "SELECT event_type, SUM(count) AS total \
     FROM events \
     GROUP BY event_type \
     ORDER BY event_type";
+const DUCKDB_TARGET_BATCH_ROWS: usize = 2_048;
 
 #[derive(Clone, Copy)]
 struct BenchmarkCase {
@@ -141,6 +143,43 @@ fn arrow_select_sql(batch_count: usize) -> String {
     queries.pop().unwrap_or_default()
 }
 
+fn compact_batches(batches: &[RecordBatch], target_rows: usize) -> Result<Vec<RecordBatch>> {
+    if batches.len() <= 1 {
+        return Ok(batches.to_vec());
+    }
+
+    let schema = batches[0].schema();
+    let mut compacted = Vec::new();
+    let mut pending = Vec::new();
+    let mut pending_rows = 0;
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        if pending.is_empty() && batch.num_rows() >= target_rows {
+            compacted.push(batch.clone());
+            continue;
+        }
+
+        pending.push(batch);
+        pending_rows += batch.num_rows();
+
+        if pending_rows >= target_rows {
+            compacted.push(concat_batches(&schema, pending.iter().copied())?);
+            pending.clear();
+            pending_rows = 0;
+        }
+    }
+
+    if !pending.is_empty() {
+        compacted.push(concat_batches(&schema, pending.iter().copied())?);
+    }
+
+    Ok(compacted)
+}
+
 fn arrow_params(batches: &[RecordBatch]) -> Vec<usize> {
     batches
         .iter()
@@ -149,21 +188,22 @@ fn arrow_params(batches: &[RecordBatch]) -> Vec<usize> {
 }
 
 fn run_duckdb_query(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+    let compacted_batches = compact_batches(batches, DUCKDB_TARGET_BATCH_ROWS)?;
     let conn = Connection::open_in_memory()?;
     conn.register_table_function::<ArrowVTab>("arrow")?;
-    let max_expression_depth = (batches.len() * 4).max(1_000);
+    let max_expression_depth = (compacted_batches.len() * 4).max(1_000);
     conn.execute(
         &format!("SET max_expression_depth TO {max_expression_depth}"),
         [],
     )?;
     let query_sql = format!(
         "WITH events AS ({}) {}",
-        arrow_select_sql(batches.len()),
+        arrow_select_sql(compacted_batches.len()),
         QUERY
     );
     let mut stmt = conn.prepare(&query_sql)?;
     Ok(stmt
-        .query_arrow(params_from_iter(arrow_params(batches)))?
+        .query_arrow(params_from_iter(arrow_params(&compacted_batches)))?
         .collect())
 }
 
