@@ -1,4 +1,4 @@
-use arrow::compute::concat_batches;
+use arrow::compute::{concat_batches, partition, sort_to_indices, take};
 use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampNanosecondType;
 use arrow_array::{Array, RecordBatch};
@@ -9,11 +9,13 @@ use arroyo_operator::operator::{
 };
 use arroyo_planner::physical::{ArroyoPhysicalExtensionCodec, DecodingContext};
 use arroyo_rpc::{
+    Converter,
     df::ArroyoSchema,
     errors::DataflowResult,
     grpc::{api, rpc::TableConfig},
 };
 use arroyo_state::timestamp_table_config;
+use arroyo_types::{Watermark, from_nanos};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::ExecutionPlan;
@@ -35,6 +37,8 @@ use tracing::warn;
 struct AsofConfig {
     left_ts_index: usize,
     right_ts_index: usize,
+    inequality: api::AsofInequality,
+    left_outer: bool,
 }
 
 pub struct JoinWithExpiration {
@@ -44,6 +48,7 @@ pub struct JoinWithExpiration {
     right_input_schema: ArroyoSchema,
     left_schema: ArroyoSchema,
     right_schema: ArroyoSchema,
+    left_key_converter: Converter,
     left_passer: Arc<RwLock<Option<RecordBatch>>>,
     right_passer: Arc<RwLock<Option<RecordBatch>>>,
     join_execution_plan: Arc<dyn ExecutionPlan>,
@@ -135,41 +140,9 @@ impl JoinWithExpiration {
         &mut self,
         record_batch: RecordBatch,
         ctx: &mut OperatorContext,
-        collector: &mut dyn Collector,
+        _collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
-        let cfg = self.asof.expect("asof config required");
-
-        for i in 0..record_batch.num_rows() {
-            let keyed_row = record_batch.slice(i, 1);
-            let unkeyed_row = self.left_input_schema.unkeyed_batch(&keyed_row)?;
-            let left_ts = ts_value(&unkeyed_row, cfg.left_ts_index)?;
-
-            // Insert the left row and capture the storage key for the lookup.
-            let left_table = ctx
-                .table_manager
-                .get_key_time_table("left", ctx.last_present_watermark())
-                .await?;
-            let mut key_rows = left_table.insert(keyed_row).await?;
-            let Some(key_row) = key_rows.pop() else {
-                continue;
-            };
-
-            let right_table = ctx
-                .table_manager
-                .get_key_time_table("right", ctx.last_present_watermark())
-                .await?;
-            let Some(candidates) = right_table.get_batch(key_row.as_ref())? else {
-                continue;
-            };
-            let candidates = candidates.clone();
-
-            if let Some(best_idx) = pick_asof_right(&candidates, cfg.right_ts_index, left_ts)? {
-                let best_right = candidates.slice(best_idx, 1);
-                self.compute_pair(unkeyed_row, best_right, collector)
-                    .await?;
-            }
-        }
-
+        self.insert_pending_left_batch(record_batch, ctx).await?;
         Ok(())
     }
 
@@ -181,65 +154,131 @@ impl JoinWithExpiration {
         &mut self,
         right_batch: RecordBatch,
         ctx: &mut OperatorContext,
+        _collector: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        let right_table = ctx
+            .table_manager
+            .get_key_time_table("right", ctx.last_present_watermark())
+            .await?;
+        right_table.insert(right_batch).await?;
+        Ok(())
+    }
+
+    async fn insert_pending_left_batch(
+        &mut self,
+        batch: RecordBatch,
+        ctx: &mut OperatorContext,
+    ) -> DataflowResult<()> {
+        let pending_left = ctx
+            .table_manager
+            .get_expiring_time_key_table("left_pending", ctx.last_present_watermark())
+            .await?;
+
+        let time_column = batch
+            .column(self.left_input_schema.timestamp_index)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .ok_or_else(|| {
+                arrow::error::ArrowError::InvalidArgumentError(
+                    "ASOF JOIN expected Timestamp(Nanosecond) left input".into(),
+                )
+            })?;
+
+        let max_timestamp = arrow::compute::max(time_column).ok_or_else(|| {
+            arrow::error::ArrowError::InvalidArgumentError(
+                "ASOF JOIN left batch must have a max timestamp".into(),
+            )
+        })?;
+        let min_timestamp = arrow::compute::min(time_column).ok_or_else(|| {
+            arrow::error::ArrowError::InvalidArgumentError(
+                "ASOF JOIN left batch must have a min timestamp".into(),
+            )
+        })?;
+
+        if max_timestamp == min_timestamp {
+            pending_left.insert(from_nanos(max_timestamp as u128), batch);
+            return Ok(());
+        }
+
+        let indices = sort_to_indices(time_column, None, None)?;
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|c| take(c, &indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sorted = RecordBatch::try_new(batch.schema(), columns)?;
+        let sorted_timestamps = take(time_column, &indices, None)?;
+        let ranges = partition(std::slice::from_ref(&sorted_timestamps))?.ranges();
+        let typed_timestamps = sorted_timestamps
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            .ok_or_else(|| {
+                arrow::error::ArrowError::InvalidArgumentError(
+                    "ASOF JOIN failed to read sorted left timestamps".into(),
+                )
+            })?;
+
+        for range in ranges {
+            let timestamp = from_nanos(typed_timestamps.value(range.start) as u128);
+            pending_left.insert(
+                timestamp,
+                sorted.slice(range.start, range.end - range.start),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn process_finalized_left_batch(
+        &mut self,
+        batch: RecordBatch,
+        ctx: &mut OperatorContext,
         collector: &mut dyn Collector,
     ) -> DataflowResult<()> {
         let cfg = self.asof.expect("asof config required");
+        let empty_right = RecordBatch::new_empty(self.right_schema.schema.clone());
 
-        for i in 0..right_batch.num_rows() {
-            let keyed_row = right_batch.slice(i, 1);
-            let unkeyed_row = self.right_input_schema.unkeyed_batch(&keyed_row)?;
-            let new_right_ts = ts_value(&unkeyed_row, cfg.right_ts_index)?;
+        for i in 0..batch.num_rows() {
+            let keyed_row = batch.slice(i, 1);
+            let unkeyed_row = self.left_input_schema.unkeyed_batch(&keyed_row)?;
+            let Some(left_ts) = ts_value(&unkeyed_row, cfg.left_ts_index)? else {
+                if cfg.left_outer {
+                    self.compute_pair(unkeyed_row, empty_right.clone(), collector)
+                        .await?;
+                }
+                continue;
+            };
+
+            let key_row = storage_key(
+                &keyed_row,
+                &self.left_input_schema,
+                &self.left_key_converter,
+            )?;
 
             let right_table = ctx
                 .table_manager
                 .get_key_time_table("right", ctx.last_present_watermark())
                 .await?;
-            let mut key_rows = right_table.insert(keyed_row).await?;
-            let Some(key_row) = key_rows.pop() else {
-                continue;
-            };
+            let candidates = right_table.get_batch(&key_row)?.cloned();
 
-            // After insertion, look up the full buffered right state for this
-            // key and the buffered left rows.
-            let right_table = ctx
-                .table_manager
-                .get_key_time_table("right", ctx.last_present_watermark())
-                .await?;
-            let Some(all_right_for_key) = right_table.get_batch(key_row.as_ref())? else {
-                continue;
-            };
-            let all_right_for_key = all_right_for_key.clone();
-
-            let left_table = ctx
-                .table_manager
-                .get_key_time_table("left", ctx.last_present_watermark())
-                .await?;
-            let Some(left_candidates) = left_table.get_batch(key_row.as_ref())? else {
-                continue;
-            };
-            let left_candidates = left_candidates.clone();
-
-            for j in 0..left_candidates.num_rows() {
-                let left_row = left_candidates.slice(j, 1);
-                let left_ts = ts_value(&left_row, cfg.left_ts_index)?;
-
-                if new_right_ts > left_ts {
-                    continue;
+            let best_right = match candidates {
+                Some(candidates) => {
+                    pick_asof_right(&candidates, cfg.right_ts_index, cfg.inequality, left_ts)?
+                        .map(|idx| candidates.slice(idx, 1))
                 }
-                let Some(best_idx) =
-                    pick_asof_right(&all_right_for_key, cfg.right_ts_index, left_ts)?
-                else {
-                    continue;
-                };
-                let best_ts = ts_value(&all_right_for_key.slice(best_idx, 1), cfg.right_ts_index)?;
-                if best_ts != new_right_ts {
-                    // A previously-buffered right row is still the ASOF
-                    // match; emitting now would duplicate an earlier
-                    // emission.
-                    continue;
+                None => None,
+            };
+
+            match best_right {
+                Some(best_right) => {
+                    self.compute_pair(unkeyed_row, best_right, collector)
+                        .await?;
                 }
-                self.compute_pair(left_row, unkeyed_row.clone(), collector)
-                    .await?;
+                None if cfg.left_outer => {
+                    self.compute_pair(unkeyed_row, empty_right.clone(), collector)
+                        .await?;
+                }
+                None => {}
             }
         }
 
@@ -320,13 +359,89 @@ impl ArrowOperator for JoinWithExpiration {
         Ok(())
     }
 
+    async fn handle_watermark(
+        &mut self,
+        watermark: Watermark,
+        ctx: &mut OperatorContext,
+        collector: &mut dyn Collector,
+    ) -> DataflowResult<Option<Watermark>> {
+        if self.asof.is_none() {
+            return Ok(Some(watermark));
+        }
+
+        let Some(watermark_time) = ctx.last_present_watermark() else {
+            return Ok(Some(watermark));
+        };
+
+        loop {
+            let next_time = {
+                let pending_left = ctx
+                    .table_manager
+                    .get_expiring_time_key_table("left_pending", ctx.last_present_watermark())
+                    .await?;
+                pending_left.get_min_time()
+            };
+
+            let Some(next_time) = next_time else {
+                break;
+            };
+            if next_time >= watermark_time {
+                break;
+            }
+
+            let batches = {
+                let pending_left = ctx
+                    .table_manager
+                    .get_expiring_time_key_table("left_pending", ctx.last_present_watermark())
+                    .await?;
+                pending_left.expire_timestamp(next_time)
+            };
+
+            for batch in batches {
+                self.process_finalized_left_batch(batch, ctx, collector)
+                    .await?;
+            }
+        }
+
+        Ok(Some(Watermark::EventTime(watermark_time)))
+    }
+
+    async fn handle_checkpoint(
+        &mut self,
+        _: arroyo_types::CheckpointBarrier,
+        ctx: &mut OperatorContext,
+        _: &mut dyn Collector,
+    ) -> DataflowResult<()> {
+        if self.asof.is_none() {
+            return Ok(());
+        }
+
+        let watermark = ctx.last_present_watermark();
+        ctx.table_manager
+            .get_expiring_time_key_table("left_pending", watermark)
+            .await?
+            .flush(watermark)
+            .await?;
+        Ok(())
+    }
+
     fn tables(&self) -> HashMap<String, TableConfig> {
         let mut tables = HashMap::new();
+        let left_table_name = if self.asof.is_some() {
+            "left_pending"
+        } else {
+            "left"
+        };
+        let left_table_description = if self.asof.is_some() {
+            "pending ASOF left join data"
+        } else {
+            "left join data"
+        };
         tables.insert(
-            "left".to_string(),
+            left_table_name.to_string(),
             timestamp_table_config(
-                "left",
-                "left join data",
+                left_table_name,
+                left_table_description,
                 self.left_expiration,
                 false,
                 self.left_input_schema.clone(),
@@ -374,6 +489,7 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
         let right_input_schema: ArroyoSchema = config.right_schema.unwrap().try_into()?;
         let left_schema = left_input_schema.schema_without_keys()?;
         let right_schema = right_input_schema.schema_without_keys()?;
+        let left_key_converter = left_input_schema.converter(false)?;
 
         let mut ttl = Duration::from_micros(
             config
@@ -394,12 +510,16 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
                 right_input_schema,
                 left_schema,
                 right_schema,
+                left_key_converter,
                 left_passer,
                 right_passer,
                 join_execution_plan,
                 asof: config.asof.map(|a| AsofConfig {
                     left_ts_index: a.left_ts_index as usize,
                     right_ts_index: a.right_ts_index as usize,
+                    inequality: api::AsofInequality::try_from(a.inequality)
+                        .unwrap_or(api::AsofInequality::Gte),
+                    left_outer: a.left_outer,
                 }),
             },
         )))
@@ -409,7 +529,7 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
 /// Read the `i64` value at row 0 of the timestamp column of a single-row
 /// (unkeyed) batch. ASOF joins require the timestamp column to be a
 /// `Timestamp(Nanosecond)` (the canonical Arroyo event-time representation).
-fn ts_value(batch: &RecordBatch, idx: usize) -> DataflowResult<i64> {
+fn ts_value(batch: &RecordBatch, idx: usize) -> DataflowResult<Option<i64>> {
     let arr = batch.column(idx);
     let ts = arr
         .as_primitive_opt::<TimestampNanosecondType>()
@@ -420,20 +540,31 @@ fn ts_value(batch: &RecordBatch, idx: usize) -> DataflowResult<i64> {
             ))
         })?;
     if ts.is_null(0) {
-        return Err(arrow::error::ArrowError::InvalidArgumentError(
-            "ASOF JOIN does not support NULL timestamps".into(),
-        )
-        .into());
+        return Ok(None);
     }
-    Ok(ts.value(0))
+    Ok(Some(ts.value(0)))
 }
 
-/// Return the index in `candidates` of the row with the largest `right_ts`
-/// value that is still `<=` `left_ts`, or `None` if no such row exists. NULL
-/// timestamps are skipped.
+fn storage_key(
+    batch: &RecordBatch,
+    schema: &ArroyoSchema,
+    converter: &Converter,
+) -> DataflowResult<Vec<u8>> {
+    let Some(storage_keys) = schema.storage_keys() else {
+        return Ok(vec![]);
+    };
+    let key_columns = batch.project(storage_keys)?.columns().to_vec();
+    Ok(converter.convert_columns(&key_columns)?.as_ref().to_vec())
+}
+
+/// Return the index in `candidates` of the single right row that satisfies the
+/// configured ASOF inequality and best matches the left timestamp. For `>=` and
+/// `>`, this is the latest qualifying right row; for `<=` and `<`, it is the
+/// earliest qualifying right row. NULL timestamps are skipped.
 fn pick_asof_right(
     candidates: &RecordBatch,
     right_ts_index: usize,
+    inequality: api::AsofInequality,
     left_ts: i64,
 ) -> DataflowResult<Option<usize>> {
     let arr = candidates.column(right_ts_index);
@@ -452,12 +583,26 @@ fn pick_asof_right(
             continue;
         }
         let v = ts.value(i);
-        if v > left_ts {
+        let qualifies = match inequality {
+            api::AsofInequality::Gte => v <= left_ts,
+            api::AsofInequality::Gt => v < left_ts,
+            api::AsofInequality::Lte => v >= left_ts,
+            api::AsofInequality::Lt => v > left_ts,
+        };
+        if !qualifies {
             continue;
         }
-        match best {
-            Some((_, b)) if b >= v => {}
-            _ => best = Some((i, v)),
+
+        match (inequality, best) {
+            (api::AsofInequality::Gte, Some((_, b))) | (api::AsofInequality::Gt, Some((_, b)))
+                if b > v => {}
+            (api::AsofInequality::Lte, Some((_, b))) | (api::AsofInequality::Lt, Some((_, b)))
+                if b < v => {}
+            _ => {
+                // Prefer the later row on ties so selection matches the final
+                // qualifying row in partition order.
+                best = Some((i, v));
+            }
         }
     }
     Ok(best.map(|(i, _)| i))
@@ -485,37 +630,72 @@ mod tests {
     fn pick_asof_right_returns_largest_le_left_ts() {
         let batch = ts_batch(vec![Some(10), Some(20), Some(30), Some(40)]);
         // left_ts = 25 → best index is 1 (value 20)
-        assert_eq!(pick_asof_right(&batch, 1, 25).unwrap(), Some(1));
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Gte, 25).unwrap(),
+            Some(1)
+        );
         // left_ts = 40 → best is the largest <= 40 (index 3)
-        assert_eq!(pick_asof_right(&batch, 1, 40).unwrap(), Some(3));
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Gte, 40).unwrap(),
+            Some(3)
+        );
         // left_ts = 5 → no candidate
-        assert_eq!(pick_asof_right(&batch, 1, 5).unwrap(), None);
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Gte, 5).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn pick_asof_right_skips_nulls() {
         let batch = ts_batch(vec![None, Some(10), None, Some(20), None]);
-        assert_eq!(pick_asof_right(&batch, 1, 15).unwrap(), Some(1));
-        assert_eq!(pick_asof_right(&batch, 1, 25).unwrap(), Some(3));
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Gte, 15).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Gte, 25).unwrap(),
+            Some(3)
+        );
         // All-null candidates → None
         let null_batch = ts_batch(vec![None, None, None]);
-        assert_eq!(pick_asof_right(&null_batch, 1, 100).unwrap(), None);
+        assert_eq!(
+            pick_asof_right(&null_batch, 1, api::AsofInequality::Gte, 100).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn pick_asof_right_picks_first_when_tied_on_max() {
-        // Two rows tie on the same max value <= left_ts. The kernel must
-        // return one (current implementation prefers the earlier index).
+    fn pick_asof_right_prefers_later_row_on_ties() {
         let batch = ts_batch(vec![Some(10), Some(10), Some(5)]);
-        let got = pick_asof_right(&batch, 1, 12).unwrap();
-        assert!(got == Some(0) || got == Some(1));
+        let got = pick_asof_right(&batch, 1, api::AsofInequality::Gte, 12).unwrap();
+        assert_eq!(got, Some(1));
+    }
+
+    #[test]
+    fn pick_asof_right_supports_all_inequalities() {
+        let batch = ts_batch(vec![Some(10), Some(20), Some(30), Some(40)]);
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Gt, 20).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Lte, 25).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            pick_asof_right(&batch, 1, api::AsofInequality::Lt, 30).unwrap(),
+            Some(3)
+        );
     }
 
     #[test]
     fn pick_asof_right_rejects_non_timestamp_column() {
         // Column 0 is Int64, not Timestamp → kernel must error out.
         let batch = ts_batch(vec![Some(1)]);
-        let err = pick_asof_right(&batch, 0, 0).unwrap_err().to_string();
+        let err = pick_asof_right(&batch, 0, api::AsofInequality::Gte, 0)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("Timestamp"),
             "expected Timestamp type error, got: {err}"
@@ -525,14 +705,13 @@ mod tests {
     #[test]
     fn ts_value_reads_first_row() {
         let batch = ts_batch(vec![Some(123), Some(456)]);
-        assert_eq!(ts_value(&batch, 1).unwrap(), 123);
+        assert_eq!(ts_value(&batch, 1).unwrap(), Some(123));
     }
 
     #[test]
-    fn ts_value_errors_on_null() {
+    fn ts_value_returns_none_on_null() {
         let batch = ts_batch(vec![None]);
-        let err = ts_value(&batch, 1).unwrap_err().to_string();
-        assert!(err.contains("NULL"), "expected NULL error, got: {err}");
+        assert_eq!(ts_value(&batch, 1).unwrap(), None);
     }
 
     #[test]

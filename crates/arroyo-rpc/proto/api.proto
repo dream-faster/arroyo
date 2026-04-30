@@ -76,6 +76,15 @@ message AsofJoinConfig {
   uint32 left_ts_index = 1;
   // Index of the right timestamp column in the (unkeyed) right input schema.
   uint32 right_ts_index = 2;
+  AsofInequality inequality = 3;
+  bool left_outer = 4;
+}
+
+enum AsofInequality {
+  ASOF_INEQUALITY_GTE = 0;
+  ASOF_INEQUALITY_GT = 1;
+  ASOF_INEQUALITY_LTE = 2;
+  ASOF_INEQUALITY_LT = 3;
 }
 
 message JoinOperator {

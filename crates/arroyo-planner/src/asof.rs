@@ -19,10 +19,10 @@
 //!    left/right batch to the rows that satisfy ASOF semantics before feeding
 //!    the inner-join physical plan.
 //!
-//! Restrictions: inner join only, exactly one inequality in the
-//! `MATCH_CONDITION` (must be `>=`). Additional non-marker filter conditions
-//! in the ON clause beyond the match condition and equi-conditions are
-//! preserved and pushed through to the underlying DataFusion inner join.
+//! Restrictions: exactly one inequality in the `MATCH_CONDITION` (one of
+//! `>=`, `>`, `<=`, `<`). Additional non-marker filter conditions in the ON
+//! clause beyond the match condition and equi-conditions are preserved and
+//! pushed through to the underlying DataFusion join.
 
 use sqlparser::ast::{
     BinaryOperator, Cte, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
@@ -35,6 +35,70 @@ use sqlparser::parser::ParserError;
 /// the join as ASOF and to carry the left/right timestamp expressions through
 /// DataFusion's SQL → logical plan stage.
 pub const ASOF_MARKER_UDF: &str = "_arroyo_asof";
+
+/// The bundled sqlparser fork supports `ASOF JOIN`, but not DuckDB's
+/// `ASOF LEFT JOIN` spelling. Normalize the DuckDB surface syntax into an
+/// equivalent plain `LEFT JOIN` whose `ON` clause carries the ASOF inequality
+/// and marker UDF so the rest of planning can proceed unchanged.
+pub fn normalize_duckdb_asof_left_joins(sql: &str) -> Result<String, ParserError> {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut cursor = 0;
+
+    while let Some(asof_idx) = find_keyword_outside(sql, "ASOF", cursor).filter(|idx| {
+        find_keyword_outside(sql, "LEFT", idx + "ASOF".len())
+            .is_some_and(|left_idx| sql[idx + "ASOF".len()..left_idx].trim().is_empty())
+            && find_keyword_outside(sql, "JOIN", idx + "ASOF LEFT".len())
+                .is_some_and(|join_idx| sql[idx + "ASOF LEFT".len()..join_idx].trim().is_empty())
+    }) {
+        let left_idx = find_keyword_outside(sql, "LEFT", asof_idx + "ASOF".len()).unwrap();
+        let join_idx = find_keyword_outside(sql, "JOIN", left_idx + "LEFT".len()).unwrap();
+        let match_idx = find_keyword_outside(sql, "MATCH_CONDITION", join_idx + "JOIN".len())
+            .ok_or_else(|| {
+                ParserError::ParserError(
+                    "ASOF LEFT JOIN requires a MATCH_CONDITION clause".to_string(),
+                )
+            })?;
+
+        normalized.push_str(&sql[cursor..asof_idx]);
+        normalized.push_str("LEFT JOIN");
+        normalized.push_str(&sql[join_idx + "JOIN".len()..match_idx]);
+
+        let mut pos = match_idx + "MATCH_CONDITION".len();
+        pos = skip_whitespace(sql, pos);
+        let (match_condition, after_match) = extract_parenthesized(sql, pos)?;
+
+        let on_idx = find_keyword_outside(sql, "ON", after_match).ok_or_else(|| {
+            ParserError::ParserError("ASOF LEFT JOIN requires an ON clause".to_string())
+        })?;
+        if !sql[after_match..on_idx].trim().is_empty() {
+            return Err(ParserError::ParserError(
+                "unexpected tokens between MATCH_CONDITION and ON in ASOF LEFT JOIN".to_string(),
+            ));
+        }
+
+        let on_start = skip_whitespace(sql, on_idx + "ON".len());
+        let on_end = find_join_constraint_end(sql, on_start);
+        let on_expr = sql[on_start..on_end].trim();
+        let (left_ts, right_ts) = split_match_condition(match_condition.trim())?;
+
+        normalized.push_str(" ON (");
+        normalized.push_str(on_expr);
+        normalized.push_str(") AND (");
+        normalized.push_str(match_condition.trim());
+        normalized.push_str(") AND ");
+        normalized.push_str(ASOF_MARKER_UDF);
+        normalized.push('(');
+        normalized.push_str(left_ts.trim());
+        normalized.push_str(", ");
+        normalized.push_str(right_ts.trim());
+        normalized.push(')');
+
+        cursor = on_end;
+    }
+
+    normalized.push_str(&sql[cursor..]);
+    Ok(normalized)
+}
 
 /// Rewrite every `ASOF JOIN ... MATCH_CONDITION (...) ON (...)` in `statements`
 /// into a regular `INNER JOIN` whose ON expression carries an `_arroyo_asof`
@@ -124,19 +188,22 @@ fn rewrite_join_operator(join: &mut Join) -> Result<(), ParserError> {
         return Ok(());
     };
 
-    // Validate match_condition: must be `<lhs> >= <rhs>` (a single inequality).
+    // Validate match_condition: must be a single supported inequality.
     let (lhs, rhs) = match match_condition {
         Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::GtEq => ((**left).clone(), (**right).clone()),
+            BinaryOperator::GtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Lt => ((**left).clone(), (**right).clone()),
             _ => {
                 return Err(ParserError::ParserError(format!(
-                    "ASOF JOIN MATCH_CONDITION must be a single `>=` inequality, got `{op}`"
+                    "ASOF JOIN MATCH_CONDITION must be a single inequality (`>=`, `>`, `<=`, `<`), got `{op}`"
                 )));
             }
         },
         other => {
             return Err(ParserError::ParserError(format!(
-                "ASOF JOIN MATCH_CONDITION must be `<left_ts> >= <right_ts>`, got `{other}`"
+                "ASOF JOIN MATCH_CONDITION must be a single inequality comparison, got `{other}`"
             )));
         }
     };
@@ -192,6 +259,171 @@ fn make_marker_call(lhs: Expr, rhs: Expr) -> Expr {
     })
 }
 
+fn find_keyword_outside(sql: &str, keyword: &str, start: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'(' if !in_single_quote && !in_double_quote => depth += 1,
+            b')' if !in_single_quote && !in_double_quote && depth > 0 => depth -= 1,
+            _ => {}
+        }
+
+        if depth == 0
+            && !in_single_quote
+            && !in_double_quote
+            && i + keyword_bytes.len() <= bytes.len()
+            && sql[i..i + keyword_bytes.len()].eq_ignore_ascii_case(keyword)
+            && is_word_boundary(bytes, i.saturating_sub(1))
+            && is_word_boundary(bytes, i + keyword_bytes.len())
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn is_word_boundary(bytes: &[u8], index: usize) -> bool {
+    if index >= bytes.len() {
+        return true;
+    }
+    !bytes[index].is_ascii_alphanumeric() && bytes[index] != b'_'
+}
+
+fn skip_whitespace(sql: &str, mut pos: usize) -> usize {
+    while pos < sql.len() && sql.as_bytes()[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    pos
+}
+
+fn extract_parenthesized(sql: &str, open_paren: usize) -> Result<(&str, usize), ParserError> {
+    if sql.as_bytes().get(open_paren) != Some(&b'(') {
+        return Err(ParserError::ParserError(
+            "expected parenthesized MATCH_CONDITION expression".to_string(),
+        ));
+    }
+
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open_paren;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'(' if !in_single_quote && !in_double_quote => depth += 1,
+            b')' if !in_single_quote && !in_double_quote => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((&sql[open_paren + 1..i], i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Err(ParserError::ParserError(
+        "unterminated MATCH_CONDITION expression".to_string(),
+    ))
+}
+
+fn find_join_constraint_end(sql: &str, start: usize) -> usize {
+    const BOUNDARY_KEYWORDS: &[&str] = &[
+        "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "JOIN", "WHERE", "GROUP", "HAVING", "ORDER",
+        "LIMIT", "UNION", "QUALIFY", "WINDOW", ";",
+    ];
+
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'(' if !in_single_quote && !in_double_quote => depth += 1,
+            b')' if !in_single_quote && !in_double_quote => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+
+        if depth == 0 && !in_single_quote && !in_double_quote {
+            for keyword in BOUNDARY_KEYWORDS {
+                if *keyword == ";" && bytes[i] == b';' {
+                    return i;
+                }
+
+                if i + keyword.len() <= bytes.len()
+                    && sql[i..i + keyword.len()].eq_ignore_ascii_case(keyword)
+                    && is_word_boundary(bytes, i.saturating_sub(1))
+                    && is_word_boundary(bytes, i + keyword.len())
+                {
+                    return i;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    sql.len()
+}
+
+fn split_match_condition(match_condition: &str) -> Result<(&str, &str), ParserError> {
+    let bytes = match_condition.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'(' if !in_single_quote && !in_double_quote => depth += 1,
+            b')' if !in_single_quote && !in_double_quote && depth > 0 => depth -= 1,
+            b'>' | b'<' if depth == 0 && !in_single_quote && !in_double_quote => {
+                let op_len = if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    2
+                } else {
+                    1
+                };
+                let left = match_condition[..i].trim();
+                let right = match_condition[i + op_len..].trim();
+                if left.is_empty() || right.is_empty() {
+                    break;
+                }
+                return Ok((left, right));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Err(ParserError::ParserError(
+        "ASOF LEFT JOIN MATCH_CONDITION must be a single inequality".to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +438,26 @@ mod tests {
         let mut stmts = parse(sql);
         rewrite_asof_joins(&mut stmts)?;
         Ok(stmts)
+    }
+
+    #[test]
+    fn normalizes_duckdb_asof_left_join() {
+        let sql = "SELECT * FROM left_t l ASOF LEFT JOIN right_t r \
+                   MATCH_CONDITION (l.ts >= r.ts) ON l.k = r.k \
+                   WHERE l.k > 10";
+        let normalized = normalize_duckdb_asof_left_joins(sql).unwrap();
+        assert!(normalized.contains("LEFT JOIN right_t r"), "{normalized}");
+        assert!(!normalized.contains("ASOF LEFT JOIN"), "{normalized}");
+        assert!(
+            normalized.contains("_arroyo_asof(l.ts, r.ts)"),
+            "{normalized}"
+        );
+        assert!(
+            normalized.contains("ON (l.k = r.k) AND (l.ts >= r.ts)"),
+            "{normalized}"
+        );
+        assert!(normalized.contains("WHERE l.k > 10"), "{normalized}");
+        Parser::parse_sql(&ArroyoDialect {}, &normalized).unwrap();
     }
 
     /// Render each statement back to SQL — this is a stable way to assert the
@@ -242,15 +494,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_gteq_match_condition() {
-        // `>` is not allowed for v1 — only `>=`.
-        let err = rewrite("SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts > r.ts) ON l.k = r.k")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("`>=`"),
-            "expected error to mention `>=` requirement, got: {err}"
-        );
+    fn rewrites_strict_gt_match_condition() {
+        let sql = "SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts > r.ts) ON l.k = r.k";
+        let out = rewrite(sql).unwrap();
+        let s = rendered(&out);
+        assert!(s.contains("l.ts > r.ts"), "got {s}");
+        assert!(s.contains(ASOF_MARKER_UDF), "got {s}");
+    }
+
+    #[test]
+    fn rewrites_lte_match_condition() {
+        let sql = "SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts <= r.ts) ON l.k = r.k";
+        let out = rewrite(sql).unwrap();
+        let s = rendered(&out);
+        assert!(s.contains("l.ts <= r.ts"), "got {s}");
+        assert!(s.contains(ASOF_MARKER_UDF), "got {s}");
+    }
+
+    #[test]
+    fn rewrites_lt_match_condition() {
+        let sql = "SELECT * FROM l ASOF JOIN r MATCH_CONDITION (l.ts < r.ts) ON l.k = r.k";
+        let out = rewrite(sql).unwrap();
+        let s = rendered(&out);
+        assert!(s.contains("l.ts < r.ts"), "got {s}");
+        assert!(s.contains(ASOF_MARKER_UDF), "got {s}");
     }
 
     #[test]

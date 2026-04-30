@@ -1,4 +1,3 @@
---fail=`>=`
 CREATE TABLE quotes (
     symbol TEXT,
     price DOUBLE,
@@ -26,6 +25,6 @@ CREATE TABLE trades (
 );
 
 SELECT t.symbol, t.qty, q.price
-FROM trades t ASOF JOIN quotes q
-MATCH_CONDITION (t.ts > q.ts)
+FROM trades t ASOF LEFT JOIN quotes q
+MATCH_CONDITION (t.ts >= q.ts)
 ON t.symbol = q.symbol;

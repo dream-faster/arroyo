@@ -8,6 +8,7 @@ use crate::tables::ConnectorTable;
 use crate::{ArroyoSchemaProvider, fields_with_qualifiers, schema_from_df_fields_with_metadata};
 use arroyo_datastream::WindowType;
 use arroyo_rpc::UPDATING_META_FIELD;
+use arroyo_rpc::grpc::api::AsofInequality;
 use datafusion::common::tree_node::{
     Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter, TreeNodeVisitor,
 };
@@ -354,7 +355,7 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         };
         Self::check_updating(&left, &right)?;
 
-        if on.is_empty() && !is_instant {
+        if on.is_empty() && !is_instant && !is_asof {
             return not_impl_err!("Updating joins must include an equijoin condition");
         }
 
@@ -365,12 +366,14 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         // (unkeyed) input schemas. The marker args reference columns from
         // these schemas, and `unkeyed_batch()` at runtime exposes columns in
         // the same order.
-        let asof = if let Some((left_ts_expr, right_ts_expr)) = asof_marker {
+        let asof = if let Some((left_ts_expr, right_ts_expr, inequality)) = asof_marker {
             let left_idx = column_index(left.schema(), &left_ts_expr, "left")?;
             let right_idx = column_index(right.schema(), &right_ts_expr, "right")?;
             Some(AsofConfig {
                 left_ts_index: left_idx as u32,
                 right_ts_index: right_idx as u32,
+                inequality,
+                left_outer: join_type == JoinType::Left,
             })
         } else {
             None
@@ -410,18 +413,19 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
     }
 }
 
-type AsofExtractedFilter = (Option<(Expr, Expr)>, Option<Expr>);
+type AsofExtractedFilter = (Option<(Expr, Expr, AsofInequality)>, Option<Expr>);
 
 /// If `filter` contains exactly one `_arroyo_asof(left_ts, right_ts)` call,
-/// extract the two argument expressions and return the filter with that call
-/// stripped out (replaced by `TRUE`, then constant-folded).
+/// extract the two argument expressions, recover the associated inequality
+/// operator from the filter, and return the filter with the marker stripped out
+/// (replaced by `TRUE`, then constant-folded).
 fn take_asof_marker(filter: Option<Expr>) -> Result<AsofExtractedFilter> {
     let Some(filter) = filter else {
         return Ok((None, None));
     };
 
     let mut found: Option<(Expr, Expr)> = None;
-    let transformed = filter.transform_up(&mut |e: Expr| {
+    let transformed = filter.clone().transform_up(&mut |e: Expr| {
         if let Expr::ScalarFunction(ScalarFunction { func, args }) = &e
             && func.name() == ASOF_MARKER_UDF
         {
@@ -443,6 +447,17 @@ fn take_asof_marker(filter: Option<Expr>) -> Result<AsofExtractedFilter> {
         }
         Ok(Transformed::no(e))
     })?;
+
+    let inequality = if let Some((left, right)) = &found {
+        Some(find_asof_inequality(&filter, left, right)?)
+    } else {
+        None
+    };
+
+    let found = match (found, inequality) {
+        (Some((left, right)), Some(inequality)) => Some((left, right, inequality)),
+        _ => None,
+    };
 
     let stripped = simplify_trivial_and(transformed.data);
     Ok((found, stripped))
@@ -471,10 +486,47 @@ fn simplify_trivial_and(expr: Expr) -> Option<Expr> {
     }
 }
 
-/// Validate ASOF join restrictions: inner join, no windows, non-updating.
+fn find_asof_inequality(filter: &Expr, left: &Expr, right: &Expr) -> Result<AsofInequality> {
+    let mut found = None;
+    filter.apply(|expr| {
+        if let Expr::BinaryExpr(BinaryExpr {
+            left: l,
+            op,
+            right: r,
+        }) = expr
+            && **l == *left
+            && **r == *right
+        {
+            let inequality = match op {
+                Operator::GtEq => Some(AsofInequality::Gte),
+                Operator::Gt => Some(AsofInequality::Gt),
+                Operator::LtEq => Some(AsofInequality::Lte),
+                Operator::Lt => Some(AsofInequality::Lt),
+                _ => None,
+            };
+            if let Some(inequality) = inequality {
+                if found.replace(inequality).is_some() {
+                    return Err(DataFusionError::Plan(
+                        "multiple ASOF inequalities in a single join are not supported".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+
+    found.ok_or_else(|| {
+        DataFusionError::Plan(
+            "ASOF JOIN marker was present but matching inequality could not be recovered"
+                .to_string(),
+        )
+    })
+}
+
+/// Validate ASOF join restrictions: inner/left join, no windows, non-updating.
 fn check_asof_join(join: &Join) -> Result<()> {
-    if join.join_type != JoinType::Inner {
-        return plan_err!("ASOF JOIN only supports INNER joins");
+    if join.join_type != JoinType::Inner && join.join_type != JoinType::Left {
+        return plan_err!("ASOF JOIN only supports INNER and LEFT joins");
     }
     if WindowDetectingVisitor::get_window(&join.left)?.is_some()
         || WindowDetectingVisitor::get_window(&join.right)?.is_some()
