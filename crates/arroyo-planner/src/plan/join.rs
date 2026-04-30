@@ -6,6 +6,7 @@ use crate::plan::WindowDetectingVisitor;
 use crate::schemas::add_timestamp_field;
 use crate::tables::ConnectorTable;
 use crate::{ArroyoSchemaProvider, fields_with_qualifiers, schema_from_df_fields_with_metadata};
+use arrow_schema::DataType;
 use arroyo_datastream::WindowType;
 use arroyo_rpc::UPDATING_META_FIELD;
 use arroyo_rpc::grpc::api::AsofInequality;
@@ -18,8 +19,13 @@ use datafusion::common::{
 };
 use datafusion::logical_expr;
 use datafusion::logical_expr::expr::{Alias, ScalarFunction};
+use datafusion::logical_expr::expr_fn::cast;
+use datafusion::logical_expr::utils::{
+    can_hash, find_valid_equijoin_key_pair, split_conjunction_owned,
+};
 use datafusion::logical_expr::{
-    BinaryExpr, Case, Expr, Extension, Join, LogicalPlan, Operator, Projection, build_join_schema,
+    BinaryExpr, Case, Expr, ExprSchemable, Extension, Join, LogicalPlan, Operator, Projection,
+    build_join_schema,
 };
 use datafusion::prelude::coalesce;
 use datafusion::sql::unparser::expr_to_sql;
@@ -359,8 +365,15 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             return not_impl_err!("Updating joins must include an equijoin condition");
         }
 
-        let (left_expressions, right_expressions): (Vec<_>, Vec<_>) =
-            on.clone().into_iter().unzip();
+        let mut left_expressions = on.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
+        let mut right_expressions = on.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+
+        if is_asof {
+            let null_safe_keys =
+                extract_null_safe_join_keys(join.filter.as_ref(), left.schema(), right.schema())?;
+            left_expressions.extend(null_safe_keys.iter().map(|(l, _)| l.clone()));
+            right_expressions.extend(null_safe_keys.into_iter().map(|(_, r)| r));
+        }
 
         // For ASOF, locate the timestamp column indices in the pre-key-calc
         // (unkeyed) input schemas. The marker args reference columns from
@@ -411,6 +424,57 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             node: Arc::new(join_extension),
         })))
     }
+}
+
+fn extract_null_safe_join_keys(
+    filter: Option<&Expr>,
+    left_schema: &DFSchema,
+    right_schema: &DFSchema,
+) -> Result<Vec<(Expr, Expr)>> {
+    let Some(filter) = filter else {
+        return Ok(vec![]);
+    };
+
+    let mut keys = vec![];
+    for expr in split_conjunction_owned(filter.clone()) {
+        let Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::IsNotDistinctFrom,
+            right,
+        }) = expr
+        else {
+            continue;
+        };
+
+        let Some((left_expr, right_expr)) =
+            find_valid_equijoin_key_pair(&left, &right, left_schema, right_schema)?
+        else {
+            continue;
+        };
+
+        if !can_hash(&left_expr.get_type(left_schema)?)
+            || !can_hash(&right_expr.get_type(right_schema)?)
+        {
+            return plan_err!("ASOF JOIN IS NOT DISTINCT FROM keys must be hashable on both sides");
+        }
+
+        keys.push((
+            Expr::IsNull(Box::new(left_expr.clone())),
+            Expr::IsNull(Box::new(right_expr.clone())),
+        ));
+        keys.push((
+            coalesce(vec![
+                cast(left_expr, DataType::Utf8),
+                Expr::Literal(ScalarValue::Utf8(Some(String::new())), None),
+            ]),
+            coalesce(vec![
+                cast(right_expr, DataType::Utf8),
+                Expr::Literal(ScalarValue::Utf8(Some(String::new())), None),
+            ]),
+        ));
+    }
+
+    Ok(keys)
 }
 
 type AsofExtractedFilter = (Option<(Expr, Expr, AsofInequality)>, Option<Expr>);
@@ -548,4 +612,43 @@ fn column_index(schema: &DFSchema, expr: &Expr, side: &str) -> Result<usize> {
             "ASOF JOIN {side} timestamp column `{col}` not found in {side} input schema"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::Field;
+    use datafusion::common::Column;
+
+    fn join_schema(relation: &str) -> DFSchema {
+        let fields = vec![
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new(
+                "_timestamp",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ];
+        DFSchema::from_unqualified_fields(fields.into(), std::collections::HashMap::new())
+            .unwrap()
+            .replace_qualifier(relation)
+    }
+
+    #[test]
+    fn extracts_null_safe_join_keys_for_is_not_distinct_from() {
+        let left_schema = join_schema("left");
+        let right_schema = join_schema("right");
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(Some("left"), "symbol"))),
+            op: Operator::IsNotDistinctFrom,
+            right: Box::new(Expr::Column(Column::new(Some("right"), "symbol"))),
+        });
+
+        let keys = extract_null_safe_join_keys(Some(&filter), &left_schema, &right_schema).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(matches!(keys[0].0, Expr::IsNull(_)));
+        assert!(matches!(keys[0].1, Expr::IsNull(_)));
+        assert!(format!("{}", keys[1].0).contains("Utf8"));
+        assert!(format!("{}", keys[1].1).contains("Utf8"));
+    }
 }

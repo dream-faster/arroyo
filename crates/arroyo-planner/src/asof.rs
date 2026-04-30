@@ -36,6 +36,82 @@ use sqlparser::parser::ParserError;
 /// DataFusion's SQL → logical plan stage.
 pub const ASOF_MARKER_UDF: &str = "_arroyo_asof";
 
+/// DuckDB allows `ASOF JOIN ... USING (eq_key..., ordering_key)` without an
+/// explicit `MATCH_CONDITION`. Normalize that syntax into the Snowflake-style
+/// form supported by the sqlparser fork:
+///
+/// `ASOF JOIN right USING (k, ts)` →
+/// `ASOF JOIN right MATCH_CONDITION (left.ts >= right.ts) ON left.k = right.k`
+pub fn normalize_duckdb_asof_using_joins(sql: &str) -> Result<String, ParserError> {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    let mut search = 0;
+
+    while let Some(asof_idx) = find_keyword_outside(sql, "ASOF", search) {
+        let join_idx = find_keyword_outside(sql, "JOIN", asof_idx + "ASOF".len())
+            .ok_or_else(|| ParserError::ParserError("ASOF JOIN is missing JOIN".to_string()))?;
+
+        if !sql[asof_idx + "ASOF".len()..join_idx].trim().is_empty() {
+            search = asof_idx + "ASOF".len();
+            continue;
+        }
+
+        let using_idx = find_keyword_outside(sql, "USING", join_idx + "JOIN".len());
+        let match_idx = find_keyword_outside(sql, "MATCH_CONDITION", join_idx + "JOIN".len());
+
+        let Some(using_idx) = using_idx else {
+            search = asof_idx + "ASOF".len();
+            continue;
+        };
+
+        if match_idx.is_some_and(|match_idx| match_idx < using_idx) {
+            search = asof_idx + "ASOF".len();
+            continue;
+        }
+
+        normalized.push_str(&sql[cursor..join_idx + "JOIN".len()]);
+
+        let relation_segment = &sql[join_idx + "JOIN".len()..using_idx];
+        normalized.push_str(relation_segment);
+
+        let left_alias = relation_alias(&sql[..asof_idx])?;
+        let right_alias = relation_alias(relation_segment)?;
+
+        let using_start = skip_whitespace(sql, using_idx + "USING".len());
+        let (using_list, after_using) = extract_parenthesized(sql, using_start)?;
+        let columns = split_csv(using_list)?;
+        let (ordering, equality_columns) = columns.split_last().ok_or_else(|| {
+            ParserError::ParserError("ASOF JOIN USING requires at least one column".to_string())
+        })?;
+
+        normalized.push_str(" MATCH_CONDITION (");
+        normalized.push_str(&qualify_identifier(left_alias, ordering));
+        normalized.push_str(" >= ");
+        normalized.push_str(&qualify_identifier(right_alias, ordering));
+        normalized.push(')');
+
+        normalized.push_str(" ON ");
+        if equality_columns.is_empty() {
+            normalized.push_str("true");
+        } else {
+            for (i, column) in equality_columns.iter().enumerate() {
+                if i > 0 {
+                    normalized.push_str(" AND ");
+                }
+                normalized.push_str(&qualify_identifier(left_alias, column));
+                normalized.push_str(" = ");
+                normalized.push_str(&qualify_identifier(right_alias, column));
+            }
+        }
+
+        cursor = after_using;
+        search = after_using;
+    }
+
+    normalized.push_str(&sql[cursor..]);
+    Ok(normalized)
+}
+
 /// The bundled sqlparser fork supports `ASOF JOIN`, but not DuckDB's
 /// `ASOF LEFT JOIN` spelling. Normalize the DuckDB surface syntax into an
 /// equivalent plain `LEFT JOIN` whose `ON` clause carries the ASOF inequality
@@ -292,11 +368,79 @@ fn find_keyword_outside(sql: &str, keyword: &str, start: usize) -> Option<usize>
     None
 }
 
+fn relation_alias(segment: &str) -> Result<&str, ParserError> {
+    let segment = segment.trim_end();
+    if segment.is_empty() {
+        return Err(ParserError::ParserError(
+            "ASOF JOIN relation is missing".to_string(),
+        ));
+    }
+
+    let bytes = segment.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'"' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let alias = segment[start..end].trim();
+    if alias.is_empty() {
+        return Err(ParserError::ParserError(format!(
+            "could not determine relation alias from `{segment}`"
+        )));
+    }
+    Ok(alias)
+}
+
+fn qualify_identifier(alias: &str, column: &str) -> String {
+    format!("{}.{}", alias.trim(), column.trim())
+}
+
 fn is_word_boundary(bytes: &[u8], index: usize) -> bool {
     if index >= bytes.len() {
         return true;
     }
     !bytes[index].is_ascii_alphanumeric() && bytes[index] != b'_'
+}
+
+fn split_csv(input: &str) -> Result<Vec<&str>, ParserError> {
+    let mut values = vec![];
+    let mut start = 0usize;
+    let mut in_double_quote = false;
+
+    for (i, ch) in input.char_indices() {
+        match ch {
+            '"' => in_double_quote = !in_double_quote,
+            ',' if !in_double_quote => {
+                let value = input[start..i].trim();
+                if value.is_empty() {
+                    return Err(ParserError::ParserError(
+                        "empty identifier in USING clause".to_string(),
+                    ));
+                }
+                values.push(value);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    let value = input[start..].trim();
+    if value.is_empty() {
+        return Err(ParserError::ParserError(
+            "empty identifier in USING clause".to_string(),
+        ));
+    }
+    values.push(value);
+    Ok(values)
 }
 
 fn skip_whitespace(sql: &str, mut pos: usize) -> usize {
@@ -457,6 +601,23 @@ mod tests {
             "{normalized}"
         );
         assert!(normalized.contains("WHERE l.k > 10"), "{normalized}");
+        Parser::parse_sql(&ArroyoDialect {}, &normalized).unwrap();
+    }
+
+    #[test]
+    fn normalizes_duckdb_asof_using_join() {
+        let sql = "SELECT t.symbol, t.qty, q.price \
+                   FROM trades t ASOF JOIN quotes q USING (symbol, ts)";
+        let normalized = normalize_duckdb_asof_using_joins(sql).unwrap();
+        assert!(normalized.contains("ASOF JOIN quotes q"), "{normalized}");
+        assert!(
+            normalized.contains("MATCH_CONDITION (t.ts >= q.ts)"),
+            "{normalized}"
+        );
+        assert!(
+            normalized.contains("ON t.symbol = q.symbol"),
+            "{normalized}"
+        );
         Parser::parse_sql(&ArroyoDialect {}, &normalized).unwrap();
     }
 

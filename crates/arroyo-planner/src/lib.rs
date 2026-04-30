@@ -789,7 +789,8 @@ fn try_handle_set_variable(
 }
 
 pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
-    let normalized = asof::normalize_duckdb_asof_left_joins(sql)?;
+    let normalized =
+        asof::normalize_duckdb_asof_left_joins(&asof::normalize_duckdb_asof_using_joins(sql)?)?;
     let mut statements = Parser::parse_sql(&ArroyoDialect {}, &normalized)?;
     asof::rewrite_asof_joins(&mut statements)?;
     Ok(statements)
