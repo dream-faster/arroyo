@@ -47,6 +47,16 @@ message TumblingWindowAggregateOperator {
   optional bytes final_projection = 8;
 }
 
+message DuckdbTumblingWindowAggregateOperator {
+  string name = 1;
+  uint64 width_micros = 2;
+  bytes binning_function = 3;
+  ArroyoSchema input_schema = 4;
+  string sql_query = 5;
+  string input_table_name = 6;
+  optional bytes final_projection = 7;
+}
+
 message SlidingWindowAggregateOperator {
   string name = 1;
   uint64 width_micros = 2;

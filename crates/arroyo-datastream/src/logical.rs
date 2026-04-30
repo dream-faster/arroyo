@@ -36,6 +36,7 @@ pub enum OperatorName {
     LookupJoin,
     WindowFunction,
     TumblingWindowAggregate,
+    DuckdbTumblingWindowAggregate,
     SlidingWindowAggregate,
     SessionWindowAggregate,
     UpdatingAggregate,
@@ -402,6 +403,9 @@ impl LogicalProgram {
                     OperatorName::LookupJoin => "lookup-join".to_string(),
                     OperatorName::TumblingWindowAggregate => {
                         "sql-tumbling-window-aggregate".to_string()
+                    }
+                    OperatorName::DuckdbTumblingWindowAggregate => {
+                        "duckdb-tumbling-window-aggregate".to_string()
                     }
                     OperatorName::SlidingWindowAggregate => {
                         "sql-sliding-window-aggregate".to_string()
