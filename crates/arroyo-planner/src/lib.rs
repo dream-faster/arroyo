@@ -1,5 +1,6 @@
 #![allow(clippy::new_without_default)]
 
+pub mod asof;
 pub mod builder;
 pub(crate) mod extension;
 pub mod external;
@@ -264,6 +265,20 @@ impl ArroyoSchemaProvider {
                 DataType::Utf8,
             ))
             .unwrap();
+
+        // Marker UDF used to thread an ASOF join's timestamp arguments through
+        // DataFusion's SQL → logical planning. The planner detects this call,
+        // extracts the timestamp expressions, and removes the call before
+        // physical planning. See `crate::asof`.
+        for name in asof::asof_marker_udf_names() {
+            registry
+                .register_udf(Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
+                    name: name.to_string(),
+                    signature: Signature::any(2, Volatility::Volatile),
+                    return_type: Arc::new(|_| Ok(DataType::Boolean)),
+                })))
+                .unwrap();
+        }
         registry
             .register_udf(PlaceholderUdf::with_return(
                 "row_time",
@@ -776,7 +791,18 @@ fn try_handle_set_variable(
 }
 
 pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
-    Parser::parse_sql(&ArroyoDialect {}, sql)
+    asof::reject_user_authored_asof_marker(sql)?;
+    let mut statements = match Parser::parse_sql(&ArroyoDialect {}, sql) {
+        Ok(statements) => statements,
+        Err(_) => {
+            let normalized = asof::normalize_duckdb_asof_left_joins(
+                &asof::normalize_duckdb_asof_using_joins(sql)?,
+            )?;
+            Parser::parse_sql(&ArroyoDialect {}, &normalized)?
+        }
+    };
+    asof::rewrite_asof_joins(&mut statements)?;
+    Ok(statements)
 }
 
 pub async fn parse_and_get_arrow_program(
@@ -807,7 +833,6 @@ pub async fn parse_and_get_arrow_program(
         if try_handle_set_variable(&statement, &mut schema_provider)? {
             continue;
         }
-
         if let Some(table) = Table::try_from_statement(&statement, &schema_provider)? {
             schema_provider.insert_table(table);
         } else {
