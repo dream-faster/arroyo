@@ -607,6 +607,7 @@ fn column_index(schema: &DFSchema, expr: &Expr, side: &str) -> Result<usize> {
             "ASOF JOIN MATCH_CONDITION arguments must be column references; got `{expr}` for the {side} side"
         );
     };
+
     schema.index_of_column(col).map_err(|_| {
         DataFusionError::Plan(format!(
             "ASOF JOIN {side} timestamp column `{col}` not found in {side} input schema"

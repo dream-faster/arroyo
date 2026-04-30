@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use arrow::compute::{concat_batches, partition, sort_to_indices, take};
 use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampNanosecondType;
@@ -169,13 +170,14 @@ impl JoinWithExpiration {
         batch: RecordBatch,
         ctx: &mut OperatorContext,
     ) -> DataflowResult<()> {
+        let pending_schema = pending_left_schema(&self.left_input_schema, self.asof);
         let pending_left = ctx
             .table_manager
             .get_expiring_time_key_table("left_pending", ctx.last_present_watermark())
             .await?;
 
         let time_column = batch
-            .column(self.left_input_schema.timestamp_index)
+            .column(pending_schema.timestamp_index)
             .as_any()
             .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             .ok_or_else(|| {
@@ -369,7 +371,9 @@ impl ArrowOperator for JoinWithExpiration {
             return Ok(Some(watermark));
         }
 
-        let Some(watermark_time) = ctx.last_present_watermark() else {
+        let Some(watermark_time) =
+            asof_finalize_watermark_time(watermark, ctx.last_present_watermark())
+        else {
             return Ok(Some(watermark));
         };
 
@@ -403,7 +407,7 @@ impl ArrowOperator for JoinWithExpiration {
             }
         }
 
-        Ok(Some(Watermark::EventTime(watermark_time)))
+        Ok(Some(watermark))
     }
 
     async fn handle_checkpoint(
@@ -444,7 +448,7 @@ impl ArrowOperator for JoinWithExpiration {
                 left_table_description,
                 self.left_expiration,
                 false,
-                self.left_input_schema.clone(),
+                pending_left_schema(&self.left_input_schema, self.asof),
             ),
         );
         tables.insert(
@@ -502,6 +506,17 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
             ttl = Duration::from_secs(24 * 60 * 60);
         }
 
+        let asof = if let Some(a) = config.asof {
+            Some(AsofConfig {
+                left_ts_index: a.left_ts_index as usize,
+                right_ts_index: a.right_ts_index as usize,
+                inequality: decode_asof_inequality(a.inequality)?,
+                left_outer: a.left_outer,
+            })
+        } else {
+            None
+        };
+
         Ok(ConstructedOperator::from_operator(Box::new(
             JoinWithExpiration {
                 left_expiration: ttl,
@@ -514,16 +529,33 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
                 left_passer,
                 right_passer,
                 join_execution_plan,
-                asof: config.asof.map(|a| AsofConfig {
-                    left_ts_index: a.left_ts_index as usize,
-                    right_ts_index: a.right_ts_index as usize,
-                    inequality: api::AsofInequality::try_from(a.inequality)
-                        .unwrap_or(api::AsofInequality::Gte),
-                    left_outer: a.left_outer,
-                }),
+                asof,
             },
         )))
     }
+}
+
+fn asof_finalize_watermark_time(
+    watermark: Watermark,
+    last_present_watermark: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    match watermark {
+        Watermark::EventTime(_) => last_present_watermark,
+        Watermark::Idle => None,
+    }
+}
+
+fn decode_asof_inequality(value: i32) -> anyhow::Result<api::AsofInequality> {
+    api::AsofInequality::try_from(value)
+        .map_err(|_| anyhow!("invalid ASOF inequality enum value {value}"))
+}
+
+fn pending_left_schema(schema: &ArroyoSchema, asof: Option<AsofConfig>) -> ArroyoSchema {
+    let mut pending = schema.clone();
+    if let Some(asof) = asof {
+        pending.timestamp_index = asof.left_ts_index;
+    }
+    pending
 }
 
 /// Read the `i64` value at row 0 of the timestamp column of a single-row
@@ -722,5 +754,60 @@ mod tests {
             err.contains("Timestamp"),
             "expected Timestamp type error, got: {err}"
         );
+    }
+
+    #[test]
+    fn idle_watermark_does_not_trigger_asof_finalization() {
+        assert_eq!(
+            asof_finalize_watermark_time(Watermark::Idle, Some(from_nanos(5))),
+            None
+        );
+    }
+
+    #[test]
+    fn event_time_watermark_uses_last_present_value() {
+        let watermark = from_nanos(5);
+        assert_eq!(
+            asof_finalize_watermark_time(Watermark::EventTime(watermark), Some(watermark)),
+            Some(watermark)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_asof_inequality_enum() {
+        let err = decode_asof_inequality(-1).unwrap_err().to_string();
+        assert!(err.contains("invalid ASOF inequality"), "got {err}");
+    }
+
+    #[test]
+    fn pending_left_schema_uses_configured_asof_timestamp_index() {
+        let mut schema = ArroyoSchema::new_unkeyed(
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "event_ts",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+                Field::new(
+                    "match_ts",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ])),
+            0,
+        );
+        schema.timestamp_index = 0;
+
+        let pending = pending_left_schema(
+            &schema,
+            Some(AsofConfig {
+                left_ts_index: 1,
+                right_ts_index: 0,
+                inequality: api::AsofInequality::Gte,
+                left_outer: false,
+            }),
+        );
+
+        assert_eq!(pending.timestamp_index, 1);
     }
 }

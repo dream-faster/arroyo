@@ -14,8 +14,8 @@ use std::time::Duration;
 
 pub(crate) const JOIN_NODE_NAME: &str = "JoinNode";
 
-/// Indices of the left and right timestamp columns (in the keyed input
-/// schemas) used to enforce ASOF semantics in the runtime operator.
+/// Indices of the left and right ASOF ordering columns in the unkeyed input
+/// schemas used by the runtime operator after `ArroyoSchema::unkeyed_batch()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AsofConfig {
     pub left_ts_index: u32,

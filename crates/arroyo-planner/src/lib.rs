@@ -789,6 +789,7 @@ fn try_handle_set_variable(
 }
 
 pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
+    asof::reject_user_authored_asof_marker(sql)?;
     let normalized =
         asof::normalize_duckdb_asof_left_joins(&asof::normalize_duckdb_asof_using_joins(sql)?)?;
     let mut statements = Parser::parse_sql(&ArroyoDialect {}, &normalized)?;

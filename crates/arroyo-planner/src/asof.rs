@@ -1,8 +1,8 @@
 //! Support for ASOF joins.
 //!
-//! ASOF semantics: for each row on the left side, match the single most recent
-//! row on the right side whose join keys match and whose timestamp is `<=` the
-//! left row's timestamp.
+//! ASOF semantics: for each row on the left side, match the single best row on
+//! the right side whose join keys match and whose ordering timestamp satisfies
+//! the configured inequality (`>=`, `>`, `<=`, or `<`).
 //!
 //! Implementation strategy:
 //!  - The `sqlparser` fork already parses Snowflake-style
@@ -35,6 +35,16 @@ use sqlparser::parser::ParserError;
 /// the join as ASOF and to carry the left/right timestamp expressions through
 /// DataFusion's SQL → logical plan stage.
 pub const ASOF_MARKER_UDF: &str = "_arroyo_asof";
+
+pub fn reject_user_authored_asof_marker(sql: &str) -> Result<(), ParserError> {
+    if find_function_call_outside(sql, ASOF_MARKER_UDF, 0).is_some() {
+        return Err(ParserError::ParserError(format!(
+            "{ASOF_MARKER_UDF} is a reserved internal function name and cannot be called from user SQL"
+        )));
+    }
+
+    Ok(())
+}
 
 /// DuckDB allows `ASOF JOIN ... USING (eq_key..., ordering_key)` without an
 /// explicit `MATCH_CONDITION`. Normalize that syntax into the Snowflake-style
@@ -288,7 +298,8 @@ fn rewrite_join_operator(join: &mut Join) -> Result<(), ParserError> {
         JoinConstraint::On(e) => e.clone(),
         JoinConstraint::None => {
             return Err(ParserError::ParserError(
-                "ASOF JOIN requires an ON clause with at least one equi-condition".into(),
+                "ASOF JOIN requires an ON clause; use `ON true` when no equality keys are needed"
+                    .into(),
             ));
         }
         _ => {
@@ -338,20 +349,12 @@ fn make_marker_call(lhs: Expr, rhs: Expr) -> Expr {
 fn find_keyword_outside(sql: &str, keyword: &str, start: usize) -> Option<usize> {
     let bytes = sql.as_bytes();
     let keyword_bytes = keyword.as_bytes();
-    let mut depth = 0usize;
+    let mut depth = 0i64;
     let mut i = start;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
     while i < bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
-            b'(' if !in_single_quote && !in_double_quote => depth += 1,
-            b')' if !in_single_quote && !in_double_quote && depth > 0 => depth -= 1,
-            _ => {}
-        }
-
         if depth == 0
             && !in_single_quote
             && !in_double_quote
@@ -362,10 +365,23 @@ fn find_keyword_outside(sql: &str, keyword: &str, start: usize) -> Option<usize>
         {
             return Some(i);
         }
-        i += 1;
+
+        i = advance_sql_position(
+            bytes,
+            i,
+            &mut depth,
+            &mut in_single_quote,
+            &mut in_double_quote,
+        );
     }
 
     None
+}
+
+fn find_function_call_outside(sql: &str, function_name: &str, start: usize) -> Option<usize> {
+    let idx = find_keyword_outside(sql, function_name, start)?;
+    let next = skip_whitespace(sql, idx + function_name.len());
+    (sql.as_bytes().get(next) == Some(&b'(')).then_some(idx)
 }
 
 fn relation_alias(segment: &str) -> Result<&str, ParserError> {
@@ -415,11 +431,19 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParserError> {
     let mut values = vec![];
     let mut start = 0usize;
     let mut in_double_quote = false;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
 
-    for (i, ch) in input.char_indices() {
-        match ch {
-            '"' => in_double_quote = !in_double_quote,
-            ',' if !in_double_quote => {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_double_quote && bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = !in_double_quote;
+            }
+            b',' if !in_double_quote => {
                 let value = input[start..i].trim();
                 if value.is_empty() {
                     return Err(ParserError::ParserError(
@@ -431,6 +455,7 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParserError> {
             }
             _ => {}
         }
+        i += 1;
     }
 
     let value = input[start..].trim();
@@ -444,8 +469,28 @@ fn split_csv(input: &str) -> Result<Vec<&str>, ParserError> {
 }
 
 fn skip_whitespace(sql: &str, mut pos: usize) -> usize {
-    while pos < sql.len() && sql.as_bytes()[pos].is_ascii_whitespace() {
-        pos += 1;
+    let bytes = sql.as_bytes();
+    while pos < bytes.len() {
+        if bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+            continue;
+        }
+        if bytes.get(pos) == Some(&b'-') && bytes.get(pos + 1) == Some(&b'-') {
+            pos += 2;
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        if bytes.get(pos) == Some(&b'/') && bytes.get(pos + 1) == Some(&b'*') {
+            pos += 2;
+            while pos + 1 < bytes.len() && !(bytes[pos] == b'*' && bytes[pos + 1] == b'/') {
+                pos += 1;
+            }
+            pos = (pos + 2).min(bytes.len());
+            continue;
+        }
+        break;
     }
     pos
 }
@@ -458,15 +503,44 @@ fn extract_parenthesized(sql: &str, open_paren: usize) -> Result<(&str, usize), 
     }
 
     let bytes = sql.as_bytes();
-    let mut depth = 0usize;
+    let mut depth = 0i64;
     let mut i = open_paren;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'\'' if in_single_quote => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            b'\'' if !in_double_quote => in_single_quote = true,
+            b'"' if in_double_quote => {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            b'"' if !in_single_quote => in_double_quote = true,
+            b'-' if !in_single_quote && !in_double_quote && bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if !in_single_quote && !in_double_quote && bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
             b'(' if !in_single_quote && !in_double_quote => depth += 1,
             b')' if !in_single_quote && !in_double_quote => {
                 depth -= 1;
@@ -491,15 +565,44 @@ fn find_join_constraint_end(sql: &str, start: usize) -> usize {
     ];
 
     let bytes = sql.as_bytes();
-    let mut depth = 0usize;
+    let mut depth = 0i64;
     let mut i = start;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'\'' if in_single_quote => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            b'\'' if !in_double_quote => in_single_quote = true,
+            b'"' if in_double_quote => {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            b'"' if !in_single_quote => in_double_quote = true,
+            b'-' if !in_single_quote && !in_double_quote && bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if !in_single_quote && !in_double_quote && bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
             b'(' if !in_single_quote && !in_double_quote => depth += 1,
             b')' if !in_single_quote && !in_double_quote => {
                 if depth == 0 {
@@ -534,15 +637,44 @@ fn find_join_constraint_end(sql: &str, start: usize) -> usize {
 
 fn split_match_condition(match_condition: &str) -> Result<(&str, &str), ParserError> {
     let bytes = match_condition.as_bytes();
-    let mut depth = 0usize;
+    let mut depth = 0i64;
     let mut i = 0usize;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            b'"' if !in_single_quote => in_double_quote = !in_double_quote,
+            b'\'' if in_single_quote => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            b'\'' if !in_double_quote => in_single_quote = true,
+            b'"' if in_double_quote => {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            b'"' if !in_single_quote => in_double_quote = true,
+            b'-' if !in_single_quote && !in_double_quote && bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if !in_single_quote && !in_double_quote && bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
             b'(' if !in_single_quote && !in_double_quote => depth += 1,
             b')' if !in_single_quote && !in_double_quote && depth > 0 => depth -= 1,
             b'>' | b'<' if depth == 0 && !in_single_quote && !in_double_quote => {
@@ -566,6 +698,50 @@ fn split_match_condition(match_condition: &str) -> Result<(&str, &str), ParserEr
     Err(ParserError::ParserError(
         "ASOF LEFT JOIN MATCH_CONDITION must be a single inequality".to_string(),
     ))
+}
+
+fn advance_sql_position(
+    bytes: &[u8],
+    i: usize,
+    depth: &mut i64,
+    in_single_quote: &mut bool,
+    in_double_quote: &mut bool,
+) -> usize {
+    match bytes[i] {
+        b'\'' if *in_single_quote => {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                return i + 2;
+            }
+            *in_single_quote = false;
+        }
+        b'\'' if !*in_double_quote => *in_single_quote = true,
+        b'"' if *in_double_quote => {
+            if bytes.get(i + 1) == Some(&b'"') {
+                return i + 2;
+            }
+            *in_double_quote = false;
+        }
+        b'"' if !*in_single_quote => *in_double_quote = true,
+        b'-' if !*in_single_quote && !*in_double_quote && bytes.get(i + 1) == Some(&b'-') => {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            return j;
+        }
+        b'/' if !*in_single_quote && !*in_double_quote && bytes.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            return (j + 2).min(bytes.len());
+        }
+        b'(' if !*in_single_quote && !*in_double_quote => *depth += 1,
+        b')' if !*in_single_quote && !*in_double_quote && *depth > 0 => *depth -= 1,
+        _ => {}
+    }
+
+    i + 1
 }
 
 #[cfg(test)]
@@ -619,6 +795,30 @@ mod tests {
             "{normalized}"
         );
         Parser::parse_sql(&ArroyoDialect {}, &normalized).unwrap();
+    }
+
+    #[test]
+    fn ignores_keywords_inside_comments_and_escaped_strings() {
+        let sql = "SELECT '-- ASOF LEFT JOIN' AS s, 'it''s USING' AS t FROM trades";
+        assert_eq!(normalize_duckdb_asof_left_joins(sql).unwrap(), sql);
+        assert_eq!(normalize_duckdb_asof_using_joins(sql).unwrap(), sql);
+
+        let commented =
+            "SELECT * FROM trades -- ASOF LEFT JOIN quotes MATCH_CONDITION (a >= b)\nWHERE id = 1";
+        assert_eq!(
+            normalize_duckdb_asof_left_joins(commented).unwrap(),
+            commented
+        );
+    }
+
+    #[test]
+    fn rejects_user_authored_marker_call() {
+        let err = reject_user_authored_asof_marker(
+            "SELECT * FROM l JOIN r ON _arroyo_asof(l._timestamp, r._timestamp)",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("reserved internal function"), "got {err}");
     }
 
     /// Render each statement back to SQL — this is a stable way to assert the
