@@ -568,12 +568,12 @@ fn find_asof_inequality(filter: &Expr, left: &Expr, right: &Expr) -> Result<Asof
                 Operator::Lt => Some(AsofInequality::Lt),
                 _ => None,
             };
-            if let Some(inequality) = inequality {
-                if found.replace(inequality).is_some() {
-                    return Err(DataFusionError::Plan(
-                        "multiple ASOF inequalities in a single join are not supported".to_string(),
-                    ));
-                }
+            if let Some(inequality) = inequality
+                && found.replace(inequality).is_some()
+            {
+                return Err(DataFusionError::Plan(
+                    "multiple ASOF inequalities in a single join are not supported".to_string(),
+                ));
             }
         }
         Ok(TreeNodeRecursion::Continue)
