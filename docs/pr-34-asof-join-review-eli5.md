@@ -1,257 +1,259 @@
-# PR #34 ASOF JOIN review and fix plan (ELI5)
+# PR #34 ASOF JOIN review and DuckDB-compatible fix plan (ELI5)
 
-This is the simple version of the main review document.
+This is the plain-English version of the review.
 
-## What this PR is trying to do
+## What changed after the DuckDB research
 
-It adds support for **ASOF JOIN**.
+The earlier version of the plan was based on what seemed reasonable for Arroyo.
 
-In plain English, that means:
+After researching DuckDB's docs, tests, and source, the goal is now sharper:
 
-- take one row from the left side;
-- find rows on the right side with the same key;
-- pick the **latest** right row whose time is **not after** the left row's time.
+> **Make Arroyo behave like DuckDB for ASOF JOIN.**
 
-Example:
+That means we should stop designing our own ASOF rules and instead copy the
+important DuckDB ones.
 
-- right side has prices at times `10`, `15`, `25`
-- left side has a trade at time `20`
-- ASOF JOIN should pick the price at time `15`
+The detailed technical version lives in:
 
-## The short version of the review
+- `docs/duckdb-asof-compatibility-spec.md`
+- `docs/pr-34-asof-join-review.md`
 
-The PR is close, but the current version can give the **wrong answer** in some
-important streaming cases.
+## What ASOF JOIN means in DuckDB
 
-The biggest problem is this:
+Plain version:
 
-- the code can output an answer too early;
-- then a better right-side row can show up later;
-- and the code can output **another** answer for the same left row.
+- look at one row on the left
+- find right-side rows that qualify
+- keep only **one** right-side row
+- that one should be the **nearest qualifying row** according to the ASOF rule
 
-So instead of "one best match", users can get **duplicates** or **changed
-matches**.
+Most common example:
 
-## The main problems, explained simply
-
-### 1. It can answer too early
-
-Imagine:
-
-1. right row arrives at time `10`
-2. left row arrives at time `20`
-3. code outputs match `20 -> 10`
-4. later, another right row arrives at time `15`
-
-Now the correct match should be `20 -> 15`, because `15` is closer than `10`.
-
-But the old answer was already sent out. That means the system can produce:
-
-- first answer: `20 -> 10`
-- later answer: `20 -> 15`
-
-That is bad if users expect exactly one final answer.
-
-### 2. Ties are messy
-
-If two right rows have the **same timestamp**, the current code does not choose
-between them in a clean, fully deterministic way.
-
-That can lead to:
-
-- duplicate outputs
-- different outputs depending on arrival order
-- confusing behavior after replay or restore
-
-### 3. A private internal marker is exposed like a normal SQL function
-
-The implementation uses a hidden helper named `_arroyo_asof`.
-
-That helper is supposed to be for the planner only, but right now it looks too
-much like a normal SQL function. A user may be able to write it directly and
-accidentally turn a normal join into ASOF behavior.
-
-That is risky because internal plumbing should not be part of the public SQL
-surface.
-
-### 4. Some bad queries fail too late
-
-Right now, some mistakes are only caught when the job is already running.
-
-For example:
-
-- wrong timestamp type
-- nullable timestamps with unclear behavior
-- malformed ASOF conditions
-
-These should usually fail earlier, during planning, with a clear error message.
-
-### 5. It may be slow on hot keys
-
-If one key has lots of rows, the current code may scan too much state over and
-over again.
-
-That can become expensive and slow for busy streams.
-
-### 6. Old workers may misunderstand the new plan
-
-The PR adds new ASOF config to the operator message.
-
-That is wire-compatible, but an older worker that does not understand ASOF may
-still run the job and behave like a normal inequality join instead of "pick the
-single nearest row".
-
-That would silently give the wrong result.
-
-## The key decision for the fix
-
-The plan chooses one clear behavior:
-
-**Use final event-time semantics.**
+```sql
+left.time >= right.time
+```
 
 That means:
 
-- do **not** emit a left row's ASOF answer immediately;
-- wait until the watermark says it is safe;
-- then emit **one final answer**.
+- only use right rows at or before the left time
+- pick the latest such right row
 
-This is safer than guessing early and trying to fix things later.
+Example:
 
-## ELI5 fix plan
+- right times: `10`, `15`, `25`
+- left time: `20`
+- answer: `15`
 
-### Step 1: Write tests that describe the real behavior we want
+## The important DuckDB rules we must match
 
-Before changing logic, add tests for the tricky cases:
+### 1. Inner and left ASOF joins
 
-- a better right row arrives later
-- two right rows have the same timestamp
-- multi-key joins
-- bad SQL should fail clearly
-- nested ASOF joins should still be handled
+DuckDB clearly supports:
 
-Goal: the tests should prove what "correct" means.
+- `ASOF JOIN`
+- `ASOF LEFT JOIN`
 
-### Step 2: Pick a clear tie-break rule
+So Arroyo should match those.
 
-If two right rows have the same timestamp, the system must always choose the
-same one.
+### 2. Not just `>=`
 
-Recommended rule:
+DuckDB supports all four inequality directions:
 
-- **earliest right arrival wins**
+- `>=`
+- `>`
+- `<=`
+- `<`
 
-That rule is simple and stable.
+So Arroyo should not hard-code only `>=`.
 
-To support it, the runtime should store a small internal sequence number for
-right rows.
+### 3. Equality keys are optional
 
-### Step 3: Stop emitting ASOF matches immediately
+You do **not** always need something like `symbol = symbol`.
 
-This is the biggest runtime fix.
+DuckDB allows an ASOF join with only the one inequality condition.
 
-Instead of answering right away:
+So Arroyo should not force users to provide an equality key.
 
-- store left rows as "waiting"
-- store right rows as candidates
-- when the watermark advances far enough, finalize the waiting left rows
-- compute the best right match then
-- emit only once
+### 4. Extra join conditions can be `=` or `IS NOT DISTINCT FROM`
 
-That avoids duplicate answers.
+DuckDB allows normal equality matching and also the SQL form where NULLs are
+allowed to match:
 
-### Step 4: Make the planner catch bad ASOF queries earlier
+```sql
+a IS NOT DISTINCT FROM b
+```
 
-The planner should reject bad input before the worker starts.
+So Arroyo has to keep that difference. Plain `=` and
+`IS NOT DISTINCT FROM` are **not** the same.
 
-It should check:
+### 5. DuckDB's `USING` rule is special
 
-- ASOF is only used on inner joins
-- there is at least one equality key
-- the match condition is really `left_ts >= right_ts`
-- the timestamp columns are valid
-- nullable timestamps are either rejected or handled explicitly
+With:
 
-### Step 5: Hide the internal `_arroyo_asof` plumbing from users
+```sql
+ASOF JOIN ... USING (symbol, "when")
+```
 
-The internal marker should not be something users can type as if it were a
-public SQL function.
+DuckDB treats:
 
-Best fix:
+- `symbol` as equality
+- `"when"` as the ASOF ordering column
 
-- replace it with planner-only metadata
+And if you do `SELECT *`, DuckDB keeps the **left** `"when"` column in the
+merged output.
 
-If that is not possible yet:
+Arroyo should do the same.
+
+### 6. Ties should follow DuckDB's ordered result, not our old custom rule
+
+The earlier Arroyo-only plan suggested **earliest arrival wins**.
+
+That is no longer the target.
+
+DuckDB's implementation sorts the right-side rows and then picks the **final
+qualifying row** in that ordered run.
+
+So Arroyo should do the same thing in a streaming-friendly way.
+
+### 7. NULL behavior matters
+
+DuckDB's behavior is basically:
+
+- NULL ASOF ordering values do not match
+- `=` does not match NULLs
+- `IS NOT DISTINCT FROM` can match NULLs
+- `ASOF LEFT JOIN` keeps the left row and fills right columns with NULL when
+  there is no match
+
+Arroyo should copy that behavior.
+
+## What is wrong with the current PR
+
+The current PR still does not match DuckDB because it:
+
+1. only supports `>=`
+2. only supports inner ASOF
+3. assumes an equality key is required
+4. does not properly handle `IS NOT DISTINCT FROM`
+5. can emit answers too early in streaming mode
+6. can produce duplicates
+7. uses a tie rule that does not match DuckDB's ordered-run behavior
+8. exposes a private planner helper as if it were normal SQL
+
+## The new fix plan, in simple terms
+
+### Step 1: Write DuckDB-shaped tests first
+
+Add tests for:
+
+- `ASOF JOIN`
+- `ASOF LEFT JOIN`
+- all four inequality directions
+- with and without equality keys
+- `=` and `IS NOT DISTINCT FROM`
+- `USING (...)`
+- tie cases
+- bad queries that DuckDB would reject
+
+This makes the target clear.
+
+### Step 2: Teach the planner the real DuckDB rules
+
+The planner should understand:
+
+- exactly one inequality is required
+- that inequality can be `>=`, `>`, `<=`, or `<`
+- other ASOF join predicates may be `=` or `IS NOT DISTINCT FROM`
+- equality keys are optional
+- `USING (...)` follows DuckDB's special last-column rule
+
+### Step 3: Give the runtime enough information
+
+The runtime config must carry more than just two timestamp indexes.
+
+It also needs:
+
+- which inequality operator is being used
+- whether the match is strict or non-strict
+- how equality keys behave with NULLs
+- whether the join is inner or left
+
+### Step 4: Stop guessing too early in the stream
+
+DuckDB is batch, so it sees all the data before deciding.
+
+Arroyo is streaming, so the way to match DuckDB is:
+
+- wait until the watermark says the answer is final
+- then emit the answer once
+
+That gives Arroyo the same **final** result DuckDB would give.
+
+### Step 5: Use DuckDB-style tie behavior
+
+If multiple right rows have the same ordering value, Arroyo should pick the
+same kind of row DuckDB would pick:
+
+- the final qualifying row in the ordered right-side partition
+
+To do that in streaming, Arroyo should keep a stable per-partition sequence so
+ordering stays deterministic across checkpoint/replay too.
+
+### Step 6: Match DuckDB's NULL behavior
+
+Do not invent a repo-local NULL policy.
+
+Instead:
+
+- NULL ordering keys should not match
+- `=` stays NULL-sensitive
+- `IS NOT DISTINCT FROM` allows NULL-to-NULL matches
+- left ASOF join returns NULL right columns when unmatched
+
+### Step 7: Hide internal plumbing from users
+
+The internal `_arroyo_asof` helper should not act like a normal user SQL
+function.
+
+Best outcome:
+
+- move the ASOF detection fully into the planner/binder
+
+If that cannot happen yet:
 
 - reject user-written `_arroyo_asof(...)` calls
 
-### Step 6: Make the SQL rewrite more complete
+### Step 8: Document what is and is not DuckDB-compatible
 
-The ASOF rewrite currently handles the obvious cases, but nested SQL shapes may
-slip through.
+The docs should clearly say:
 
-The fix is to recurse through more table-factor shapes and add tests for
-parenthesized and nested joins.
+- which ASOF join forms are supported
+- which inequalities are supported
+- how `USING` works
+- how NULLs behave
+- how ties behave
 
-### Step 7: Strengthen the planner/runtime contract
+And they should point people to the compatibility spec.
 
-Today the planner passes timestamp column indexes to the runtime.
+## What "done" means now
 
-That works, but it is fragile. If schema layout changes, the runtime could read
-the wrong column.
+This work is done when Arroyo gives the same final answers DuckDB would give
+for the supported ASOF SQL surface.
 
-Safer fix:
+That means:
 
-- include field names as well as indexes
-- validate them when the worker starts
-
-### Step 8: Prevent old workers from silently running new ASOF plans
-
-Add capability/version checks so:
-
-- new ASOF plans only run on workers that support them
-- old workers fail fast instead of producing wrong results
-
-### Step 9: Make state lookup faster
-
-For scale, right-side candidates should be stored in timestamp order so the
-runtime can quickly find:
-
-- the best right row at or before a given left timestamp
-
-That is much better than rescanning everything for hot keys.
-
-### Step 10: Re-run the normal Rust checks before merge
-
-Before merging, run the usual checks:
-
-```text
-cargo fmt -- --check
-cargo clippy --all-targets --workspace -- -D warnings
-cargo nextest run -E 'kind(lib)'
-cargo build
-```
-
-And also confirm:
-
-- planner SQL tests pass
-- integration tests pass
-- CI is green
-- docs describe the final ASOF behavior clearly
-
-## What "done" looks like
-
-This work is done when all of these are true:
-
-1. each left row produces **zero or one** ASOF output
-2. a later better right row does **not** create duplicates
-3. equal timestamps use one deterministic tie-break rule
-4. bad ASOF SQL fails during planning with clear errors
-5. old workers cannot silently mis-run ASOF plans
-6. hot keys do not require wasteful rescanning
+1. one inequality, not zero and not two
+2. support for `>=`, `>`, `<=`, `<`
+3. support for `ASOF JOIN` and `ASOF LEFT JOIN`
+4. equality keys optional
+5. support for `=` and `IS NOT DISTINCT FROM`
+6. DuckDB-style `USING` behavior
+7. DuckDB-style NULL behavior
+8. deterministic DuckDB-compatible tie handling
+9. no duplicate speculative answers for a single left row
 
 ## One-line summary
 
-The PR has the right idea, but today it can answer too early and output the
-wrong match twice. The fix is to make ASOF finalize on watermarks, choose ties
-deterministically, validate more in the planner, and block old workers from
-silently running the new plan incorrectly.
+The new goal is not just "make ASOF JOIN work" — it is **make Arroyo's ASOF
+JOIN behave like DuckDB's ASOF JOIN**, and use streaming watermarks only as the
+mechanism for reaching DuckDB's final answers.

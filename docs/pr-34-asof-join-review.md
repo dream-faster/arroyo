@@ -19,6 +19,25 @@ row, and equal-timestamp right ties can emit rows that are not the deterministic
 to runtime and a compatibility risk if planners with `asof` jobs talk to older
 workers.
 
+After researching DuckDB's current documentation, tests, binder, and physical
+operator, the compatibility target should be updated: Arroyo should match
+DuckDB's ASOF semantics rather than the narrower local semantics assumed in the
+initial review. In particular, DuckDB compatibility means:
+
+- support `ASOF JOIN` and `ASOF LEFT JOIN`
+- support exactly one inequality from `{>=, >, <=, <}`
+- allow zero or more additional `=` or `IS NOT DISTINCT FROM` predicates
+- not require an equality key
+- support `USING (...)` with the final column as the `>=` ordering field
+- use the left/probe column as the merged output column under `USING`
+- choose the final qualifying right row in ordered right-side partition order
+  for ties
+
+The detailed compatibility spec is now captured in
+`docs/duckdb-asof-compatibility-spec.md`, and the DuckDB-compatible resolution
+plan appended below supersedes the earlier local-semantic plan where they
+conflict.
+
 ## High-priority failure modes
 
 ### 1. Late right rows can change a previously emitted ASOF match without a retraction
@@ -346,12 +365,17 @@ cargo test -p arroyo-worker arrow::join_with_expiration::tests --quiet
 
 It failed before compiling the crate with Cargo's edition-2024 feature error.
 
-## Exact resolution plan
+## Earlier local resolution plan (superseded by the DuckDB-compatible plan below)
 
-Target semantics: implement ASOF JOIN as a **final event-time join**. For each
-left row, emit at most one output row after the join can know that no earlier
-or equal-key right row with a timestamp closer to the left timestamp can still
-arrive. Do not emit speculative rows and do not require downstream retractions.
+This section is kept only as historical context from the first review pass.
+Where it conflicts with the DuckDB-compatible findings later in this document,
+the later DuckDB-compatible spec and plan are authoritative.
+
+Superseded local target semantics: implement ASOF JOIN as a **final event-time
+join**. For each left row, emit at most one output row after the join can know
+that no earlier or equal-key right row with a timestamp closer to the left
+timestamp can still arrive. Do not emit speculative rows and do not require
+downstream retractions.
 
 ### Phase 1: Lock the semantic contract in tests
 
@@ -658,7 +682,271 @@ Additional checks:
 4. Manually inspect generated physical plans for a representative ASOF query to
    confirm the marker predicate is removed before execution and the ASOF config
    is present.
-5. Confirm the user-facing documentation states the exact semantics:
-   event-time-final ASOF, inner joins only, `>=` only, unwindowed inputs only,
-   deterministic equal-timestamp tie-breaker, timestamp type/nullability rules,
-   and worker version requirement.
+5. Confirm the user-facing documentation states the exact semantics being
+   implemented. These locally scoped assumptions are superseded by the
+   DuckDB-compatible checklist below.
+
+## DuckDB compatibility findings and required corrections
+
+This section supersedes earlier recommendations where they differ.
+
+### DuckDB facts confirmed during research
+
+From DuckDB's docs, tests, binder, and physical operator:
+
+1. DuckDB supports `ASOF JOIN` and publicly documents `ASOF LEFT JOIN`.
+2. DuckDB requires **exactly one** ASOF inequality.
+3. The inequality may be any of: `>=`, `>`, `<=`, `<`.
+4. Any additional ASOF join predicates must be `=` or
+   `IS NOT DISTINCT FROM`.
+5. Equality predicates are optional; an ASOF join may have only the inequality.
+6. `USING (...)` is supported, and the **last** column in the `USING` list is
+   interpreted as the `>=` ordering column.
+7. With `USING`, `SELECT *` keeps the left/probe ordering column, not the
+   right/build ordering column.
+8. Ordered-key NULLs do not produce matches; `=` is NULL-sensitive, while
+   `IS NOT DISTINCT FROM` can match NULL partition keys.
+9. The physical operator sorts partitions and selects the **final qualifying
+   right row** in the right-side ordered run.
+10. DuckDB tests show that non-key `ON` predicates can be present and should be
+    ignored for ASOF key extraction rather than rejected wholesale.
+
+### What this means for Arroyo
+
+The current PR is not DuckDB-compatible yet because it:
+
+- hard-codes only `>=`
+- supports only inner ASOF
+- assumes an equality key is mandatory
+- treats all equality-like predicates as plain equality
+- exposes a marker UDF instead of matching DuckDB's binder-level semantics
+- chooses a tie rule that differs from DuckDB's ordered-run behavior
+
+## DuckDB-compatible resolution plan
+
+This plan supersedes the earlier local plan. The goal is:
+
+> For any finite input set and supported SQL surface, Arroyo should produce the
+> same final rows DuckDB would produce for the same ASOF query and data.
+
+Because Arroyo is streaming, watermark-based finalization is still the right
+runtime mechanism, but it should be used to reach DuckDB's **final batch
+semantics**, not to define a custom Arroyo-only ASOF behavior.
+
+### Phase A: Lock the DuckDB-compatible SQL surface in tests
+
+Files to update:
+
+- `crates/arroyo-planner/src/test/queries/asof_join.sql`
+- `crates/arroyo-planner/src/test/queries/asof_join_multi_key.sql`
+- new query fixtures under `crates/arroyo-planner/src/test/queries/`
+- worker/integration tests under `crates/arroyo-worker` and `crates/integ`
+
+Required tests:
+
+1. `ASOF JOIN` inner semantics for the common `>=` case.
+2. `ASOF LEFT JOIN` semantics with unmatched left rows producing NULL right
+   columns.
+3. A pure inequality ASOF join with **no equality key**.
+4. One test each for `>=`, `>`, `<=`, and `<`.
+5. Additional predicates using `=` and `IS NOT DISTINCT FROM`.
+6. `USING (k, ts)` support where `SELECT *` returns the left/probe `ts`.
+7. Extra non-key `ON` predicates that survive as filters but do not become ASOF
+   keys.
+8. Missing inequality -> planner error.
+9. Multiple inequalities -> planner error.
+10. Equal ordering-value ties -> deterministic selection of the final qualifying
+    right row in ordered right-partition order.
+
+Acceptance criteria:
+
+- The test corpus reflects DuckDB's public SQL behavior, not a custom Arroyo
+  subset.
+- The current PR fails the new tests in the expected places.
+
+### Phase B: Fix planner extraction to match DuckDB rules
+
+Files to update:
+
+- `crates/arroyo-planner/src/asof.rs`
+- `crates/arroyo-planner/src/plan/join.rs`
+- `crates/arroyo-planner/src/lib.rs`
+
+Steps:
+
+1. Replace the current "`MATCH_CONDITION` must be a single `>=` inequality"
+   rule with "exactly one inequality from `{>=, >, <=, <}`".
+2. Stop requiring an equality key.
+3. Permit additional join predicates that are either `=` or
+   `IS NOT DISTINCT FROM`.
+4. Preserve other `ON` predicates as ordinary filters instead of rejecting the
+   join.
+5. Add `USING` support that mirrors DuckDB:
+   - all but the last column are equality columns
+   - the last column is the `>=` ordering column
+   - merged output columns come from the left/probe side
+6. Preserve left/right orientation explicitly, because DuckDB ASOF semantics are
+   order-sensitive.
+
+Acceptance criteria:
+
+- Planner errors match DuckDB's rule shape: missing inequality, multiple
+  inequalities, unsupported extra predicate types.
+- Queries with no equality keys and queries with `IS NOT DISTINCT FROM` can
+  plan successfully.
+
+### Phase C: Extend runtime config beyond two timestamp indexes
+
+Files to update:
+
+- `crates/arroyo-rpc/proto/api.proto`
+- `crates/arroyo-planner/src/extension/join.rs`
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+
+Steps:
+
+1. Replace the minimal ASOF config with a richer config that carries:
+   - ordering direction (`>=`, `>`, `<=`, `<`)
+   - strictness
+   - left/right ordering field indexes
+   - equality-key metadata
+   - equality null semantics (`=` vs `IS NOT DISTINCT FROM`)
+   - left-join vs inner-join mode
+2. Keep backward-compatible proto numbering by only adding new field numbers.
+3. Validate config consistency when constructing the worker operator.
+
+Acceptance criteria:
+
+- Runtime has enough information to implement all DuckDB-compatible cases
+  without planner/runtime guesswork.
+
+### Phase D: Rework runtime matching to produce DuckDB-final answers
+
+Files to update:
+
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+- state storage in `crates/arroyo-state` as needed
+
+Steps:
+
+1. Stop emitting speculative ASOF rows directly from right-arrival processing.
+2. Buffer left rows until the relevant watermark proves their match result is
+   final.
+3. Partition right rows by the equality keys, including `IS NOT DISTINCT FROM`
+   behavior when requested.
+4. Store right rows in partition order that can reproduce DuckDB's "final
+   qualifying row in sorted run" behavior.
+5. Implement the inequality search for all four operators:
+   - `>=`: last right `<=` left
+   - `>`: last right `<` left
+   - `<=`: first/right-nearest row with `>=` behavior in reversed order
+   - `<`: strict version of the reversed-order case
+6. For equal ordering-value ties, pick the final qualifying row in deterministic
+   right-side ordered-run order. In Arroyo, that should be a persisted
+   per-partition secondary sequence that models right-side row order.
+7. Emit:
+   - zero or one row for inner ASOF
+   - exactly one row with NULL-padded right columns for left ASOF
+
+Acceptance criteria:
+
+- Arroyo emits the same final rows DuckDB would emit on the same finite data.
+- No duplicate outputs appear for one left row in DuckDB-compatible modes.
+
+### Phase E: Align NULL behavior with DuckDB
+
+Files to update:
+
+- planner validation in `crates/arroyo-planner`
+- runtime evaluation in `crates/arroyo-worker`
+
+Steps:
+
+1. Do **not** reject nullable ASOF columns simply because they are nullable.
+2. Implement DuckDB-compatible ordered-key behavior:
+   - NULL left ordering key -> no match
+   - NULL right ordering key -> row never selected
+3. Implement equality semantics correctly:
+   - `=` means NULLs do not match
+   - `IS NOT DISTINCT FROM` means NULLs do match
+4. Add tests for NULL ordering values and NULL partition keys.
+
+Acceptance criteria:
+
+- NULL behavior matches DuckDB result semantics instead of a repo-local policy.
+
+### Phase F: Replace local tie-break assumptions with DuckDB-compatible ordering
+
+Files to update:
+
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+- state storage in `crates/arroyo-state`
+
+Steps:
+
+1. Remove the earlier "earliest arrival wins" proposal.
+2. Replace it with:
+   - sort by DuckDB ordering field
+   - then choose the **final qualifying row** in the ordered right partition
+3. Persist a stable secondary sequence so checkpoint/replay keeps the same row
+   ordering and tie result.
+
+Acceptance criteria:
+
+- Equal-timestamp ties match the documented compatibility rule.
+- Replay and restore preserve the same selected row.
+
+### Phase G: Hide or replace the marker UDF
+
+Files to update:
+
+- `crates/arroyo-planner/src/asof.rs`
+- `crates/arroyo-planner/src/lib.rs`
+- `crates/arroyo-planner/src/plan/join.rs`
+
+Steps:
+
+1. Move toward binder/planner-side ASOF extraction instead of a public SQL marker
+   function.
+2. If the marker remains temporarily necessary, reject any user-authored
+   `_arroyo_asof(...)` call before rewrite.
+3. Ensure the physical join filter does not silently consume user predicates.
+
+Acceptance criteria:
+
+- User SQL cannot access ASOF internals in ways DuckDB users cannot.
+
+### Phase H: Document compatibility boundaries
+
+Files to update:
+
+- `docs/pr-34-asof-join-review.md`
+- `docs/pr-34-asof-join-review-eli5.md`
+- `docs/duckdb-asof-compatibility-spec.md`
+- any user-facing SQL docs for Arroyo
+
+Steps:
+
+1. Document that Arroyo targets DuckDB-compatible ASOF semantics.
+2. Document the currently supported public surface:
+   - `ASOF JOIN`
+   - `ASOF LEFT JOIN`
+   - one inequality from `{>=, >, <=, <}`
+   - optional `=` / `IS NOT DISTINCT FROM` equality predicates
+   - `USING` with DuckDB's last-column rule
+3. Do not claim compatibility for right/full ASOF joins until proven with parser
+   and runtime tests.
+
+## DuckDB-specific merge checklist
+
+Before merge, confirm all of the following:
+
+1. Planner tests cover all four inequality operators.
+2. Planner tests cover both no-equality-key and multi-key cases.
+3. Planner tests cover `IS NOT DISTINCT FROM`.
+4. Runtime/integration tests cover inner and left-ASOF semantics.
+5. Tie tests prove deterministic "final qualifying row in ordered right
+   partition" behavior.
+6. `USING` output shape matches DuckDB's left/probe-column behavior.
+7. Compatibility docs are updated and point to
+   `docs/duckdb-asof-compatibility-spec.md`.
