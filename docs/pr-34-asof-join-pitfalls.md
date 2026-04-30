@@ -9,15 +9,36 @@ This document complements `pr-34-asof-join-review.md` and the DuckDB-compat
 spec. It focuses on **failure modes that may slip through the existing test
 suite** and on **regressions to non-ASOF behavior**.
 
+## Status update after executing the follow-up fixes
+
+Most of the correctness items from the first pass are now closed. Current
+status:
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| P1 — pending-left rows stall on idle / end-of-stream | **Resolved** | `Watermark::Idle` now drains `left_pending` before the watermark is forwarded. |
+| P2 — ASOF lookback silently bounded by TTL | **Partially resolved** | ASOF now logs a dedicated warning when it falls back to the default TTL, but there is still no planner warning or eviction metric. |
+| P3 — `pick_asof_right` is O(N) per left row | **Open** | The obvious refetch overhead is gone, but selection still scans the candidate right batch linearly. |
+| P4 — null-safe key extraction reads the filter before stripping the marker | **Resolved** | ASOF key extraction now uses the marker-free filter. |
+| P5 — inequality recovery depends on `Expr` identity | **Resolved** | The inequality is now encoded in the internal marker name (`__arroyo_internal_asof_*`). |
+| P6 — equal-timestamp ties are replay-nondeterministic | **Resolved** | Ties are now broken by encoded row payload rather than insertion order. |
+| P7 — right table re-fetched once per finalized left row | **Resolved** | The right table handle is fetched once per finalized batch. |
+| P8 — `Idle` is forwarded while pending-left state remains buffered | **Resolved** | The join drains pending-left state before propagating idle. |
+| NON-ASOF-1 — normalizer false-trigger on ordinary SQL | **Substantially reduced** | `parse_sql()` now attempts the raw parser first and only falls back to ASOF-specific normalization when parsing actually fails. |
+| NON-ASOF-2 — internal marker name reserved globally | **Resolved / reduced** | The marker moved to a much less collision-prone reserved internal namespace. |
+| NON-ASOF-3 — universal pre-parse cost | **Partially resolved** | Valid non-ASOF SQL avoids the normalization passes, but ASOF fallback still pays for them. |
+| NON-ASOF-4 — every join filter is cloned and walked | **Resolved** | The planner now does a cheap marker-presence check and only rewrites filters that actually contain the ASOF marker. |
+| NON-ASOF-5 — ASCII-only boundary logic | **Open / unverified** | Still worth fuzzing, but no concrete regression was reproduced in this pass. |
+
 ---
 
 ## 1. Architecture recap (where the changes live)
 
 | Layer | File | Behaviour added | Runs for non-ASOF queries? |
 | --- | --- | --- | --- |
-| SQL pre-parse | `crates/arroyo-planner/src/lib.rs:792-797` | `reject_user_authored_asof_marker` + two text-level normalizers + `rewrite_asof_joins` | **Yes** (every query) |
-| AST rewrite | `crates/arroyo-planner/src/asof.rs` | `JoinOperator::AsOf` → `Inner(... AND _arroyo_asof(lhs,rhs))` | Walks every statement |
-| UDF registry | `crates/arroyo-planner/src/lib.rs:273-279` | Registers placeholder UDF `_arroyo_asof` | **Yes** (name reserved) |
+| SQL pre-parse | `crates/arroyo-planner/src/lib.rs:792-803` | reject internal marker calls, try raw parse first, fall back to ASOF-only normalization + `rewrite_asof_joins` on parse failure | **Mostly no** for valid non-ASOF queries |
+| AST rewrite | `crates/arroyo-planner/src/asof.rs` | `JoinOperator::AsOf` → `Inner(... AND __arroyo_internal_asof_<op>(lhs,rhs))` | Walks every statement that parsed as ASOF |
+| UDF registry | `crates/arroyo-planner/src/lib.rs:273-281` | Registers placeholder UDFs in the `__arroyo_internal_asof_*` namespace | **Yes** (reserved internal names) |
 | Logical plan | `crates/arroyo-planner/src/plan/join.rs:324-426` | `take_asof_marker`, ASOF detection, null-safe key extraction, AsofConfig | **Yes** — runs on every join |
 | Extension proto | `crates/arroyo-planner/src/extension/join.rs` | Serializes `AsofConfig` w/ inequality + left_outer | ASOF only |
 | Runtime | `crates/arroyo-worker/src/arrow/join_with_expiration.rs` | Pending-left state, watermark drain, candidate selection | Branched on `asof.is_some()` |
@@ -30,9 +51,11 @@ suite** and on **regressions to non-ASOF behavior**.
 ### 2.1 High severity
 
 **P1 — Pending-left rows can stall forever when no later watermark arrives.**
+**Status: resolved.**
 `handle_watermark` (`join_with_expiration.rs:380-408`) drains `left_pending`
-only while `next_time < watermark_time`, and `asof_finalize_watermark_time`
-returns `None` for `Watermark::Idle`. Consequences:
+only while `next_time < watermark_time`, and the earlier
+`asof_finalize_watermark_time` helper returned `None` for `Watermark::Idle`.
+Consequences:
 - A left row whose ASOF timestamp equals the maximum observed event time is
   never finalized until the watermark advances strictly past it.
 - For sources that go idle (the common bounded-source case), pending lefts
@@ -89,7 +112,7 @@ expressions and produce
 `"ASOF JOIN marker was present but matching inequality could not be recovered"`.
 
 **Fix**: stash the operator inside the marker call (e.g. encode as the
-function name `_arroyo_asof_gte`/`_lt`/…) instead of rediscovering it
+function name `__arroyo_internal_asof_gte`/`_lt`/…) instead of rediscovering it
 from the surrounding AND-tree.
 
 **P6 — `pick_asof_right` tie-breaks "later in partition order".** The
@@ -119,28 +142,27 @@ suppress the `Idle` watermark.
 ### 2.3 Low severity / nits
 
 - `pending_left_schema` clones the full `ArroyoSchema` per call (twice per
-  left batch + once in `tables()`); cache it.
+  left batch + once in `tables()`); **resolved** by caching the pending-left
+  schema in the operator state.
 - `compute_pair` builds a fresh `SessionContext` per pair
-  (`join_with_expiration.rs:300-303`); reuse one.
+  (`join_with_expiration.rs:300-303`); **resolved** by reusing a stored task
+  context.
 - `decode_asof_inequality` rejects unknown variants with `anyhow!`, which
-  is correct, but the error message should include the proto field path
-  to aid debugging.
+  is correct; **resolved** by including the proto field path in the error.
 - The DuckDB-compat spec promises `ASOF JOIN ... USING(k1, k2, ts)` with
   multiple equality keys; the planner test suite covers the multi-key
-  case but the runtime path for `IS NOT DISTINCT FROM`-derived keys uses
-  `Cast → Utf8 → Coalesce("")`, which **silently equates `NULL` with the
-  empty string** for non-string columns. Two right rows with `k=NULL` and
-  `k=""` will hash to the same bucket and the row with `k=""` will be a
-  legal ASOF candidate for a left row with `k=NULL`. Add a sentinel
-  prefix (e.g. `"\u{0}"` byte) when materialising the value key to keep
-  the null and empty-string cases distinct.
+  case. Re-review note: the earlier concern about `NULL` and `""` collapsing
+  was overstated because the derived hash key already includes a separate
+  `IsNull(expr)` component, so `NULL` and the empty string remain distinct.
 
 ---
 
 ## 3. Code paths that affect **non-ASOF** join behaviour
 
 The user explicitly asked whether the PR risks breaking non-ASOF queries.
-The answer is **yes, in two real ways**, plus a couple of nuisances.
+After the follow-up changes, the answer is **mostly no for valid SQL that the
+raw parser already accepts**. The remaining impact is mostly the reserved
+internal marker namespace and some extra fallback work on genuine ASOF syntax.
 
 ### 3.1 NON-ASOF-1 — Text-level ASOF-USING normalizer can mis-rewrite ordinary queries
 
@@ -202,8 +224,10 @@ branch and demands a `MATCH_CONDITION`, returning
 `"ASOF LEFT JOIN requires a MATCH_CONDITION clause"` for what is plainly
 a normal `LEFT JOIN`.
 
-**Severity**: medium. Likelihood is low for handwritten queries but
-non-trivial for codegen / dbt projects that auto-alias source tables.
+**Status update**: this risk is substantially reduced in practice because
+`parse_sql()` now tries the raw parser first and only runs the text-level
+normalizers on parse failure. Valid non-ASOF SQL therefore avoids the
+normalizers entirely.
 
 **Fix options**:
 - Run the rewrite *after* parsing instead of on the raw text. The
@@ -214,13 +238,13 @@ non-trivial for codegen / dbt projects that auto-alias source tables.
   (immediately preceded by `FROM`, `JOIN`, or `,`), which is what the
   grammar actually requires.
 
-### 3.2 NON-ASOF-2 — `_arroyo_asof` becomes a reserved name globally
+### 3.2 NON-ASOF-2 — the internal ASOF marker namespace is reserved globally
 
-`reject_user_authored_asof_marker` (`asof.rs:39-47`) only rejects calls
-where `_arroyo_asof` is followed by `(`. So `SELECT _arroyo_asof FROM t`
-is allowed (parses as a column ref), but the placeholder UDF is
-registered for **every** query (`lib.rs:273-279`), which means a user
-column literally named `_arroyo_asof` would *resolve* to the UDF
+`reject_user_authored_asof_marker` now rejects calls to the internal
+`__arroyo_internal_asof_*` marker family. Bare identifiers are still allowed,
+but the placeholder UDF is registered for **every** query (`lib.rs:273-279`),
+which means a user column literally named `__arroyo_internal_asof_gte` would
+*resolve* to the UDF
 reference rather than the column when used in an expression context that
 prefers a function. In practice DataFusion gives column refs precedence
 over UDFs, so this is unlikely to bite, but the name is permanently
@@ -230,12 +254,11 @@ tainted.
 
 ### 3.3 NON-ASOF-3 — Universal pre-parse cost
 
-Every SQL string now runs:
-1. `reject_user_authored_asof_marker` — full O(n) text scan.
-2. `normalize_duckdb_asof_using_joins` — full O(n) text scan.
-3. `normalize_duckdb_asof_left_joins` — full O(n) text scan, with another
-   pass through every `ASOF`-looking token.
-4. `rewrite_asof_joins` — AST walk after parse.
+Every SQL string still runs `reject_user_authored_asof_marker`, but only
+queries that fail the raw parser now pay for:
+1. `normalize_duckdb_asof_using_joins`
+2. `normalize_duckdb_asof_left_joins`
+3. `rewrite_asof_joins`
 
 For typical Arroyo-sized queries (≤ a few KB) this is negligible, but
 the constant factor is now non-zero on the hot path of `parse_sql`. Fold
@@ -244,13 +267,10 @@ favour of an AST rewrite.
 
 ### 3.4 NON-ASOF-4 — `take_asof_marker` runs on every join's filter
 
-`JoinRewriter::f_up` clones each join's filter (`plan/join.rs:336`) and
-does a `transform_up` walk before any other handling. This adds a few
-expression visits per non-ASOF join. Performance impact is negligible,
-but if the filter contains many subexpressions the clone is wasteful.
-Skip the clone if `_arroyo_asof` isn't textually present in the filter
-(or, again, encode the join kind in the join operator and skip the
-filter scan entirely for non-ASOF joins).
+`JoinRewriter::f_up` used to clone each join's filter (`plan/join.rs:336`) and
+do a `transform_up` walk before any other handling. That is now fixed: the
+planner first checks whether the expression tree contains one of the internal
+ASOF marker names and only rewrites matching joins.
 
 ### 3.5 NON-ASOF-5 — `is_word_boundary` accepts only ASCII identifiers
 
@@ -269,7 +289,7 @@ likelihood but worth fuzzing.
 | --- | --- |
 | Planner regression: alias literally named `asof` followed by `JOIN ... USING` | normalizer leaves the SQL untouched |
 | Planner regression: `events asof LEFT JOIN dim ...` | parses as a plain LEFT JOIN |
-| Planner regression: column named `_arroyo_asof` (no parens) | parses, no error |
+| Planner regression: column named `__arroyo_internal_asof_gte` (no parens) | parses, no error |
 | Worker test: bounded source with one trailing left row at watermark = max ts | row is finalized (verifies P1 fix) |
 | Worker test: `Watermark::Idle` after one left + zero rights | does not forward Idle while pending-left is non-empty (P8) |
 | Worker test: ttl < typical ASOF lag, observe metric for evicted rights | (P2) |
@@ -280,14 +300,14 @@ likelihood but worth fuzzing.
 
 ## 5. Suggested commit-sized fixes
 
-1. **Idle/end-of-stream finalization**: change
-   `asof_finalize_watermark_time` to return `Some(SystemTime::MAX)` for
-   `Watermark::Idle` *iff* downstream sees the operator going idle, and
-   suppress idle propagation while pending-left is non-empty.
+1. **Idle/end-of-stream finalization**: treat `Watermark::Idle` as a
+   drain-all signal for `left_pending`, and suppress idle propagation while
+   pending-left is non-empty. **Done.**
 2. **Inequality encoded in marker name**: replace single
-   `_arroyo_asof` UDF with four distinct names (or with one that takes
+   ASOF marker UDF with four distinct internal names (or with one that takes
    the operator as a string literal). Eliminates P5 and shrinks
-   `take_asof_marker` to a single match.
+   `take_asof_marker` to a single match. **Done with the
+   `__arroyo_internal_asof_*` family.**
 3. **Eliminate text-level normalizers**: extend the sqlparser fork (or
    add an AST rewrite pre-pass) to handle `ASOF JOIN ... USING (...)`
    and `ASOF LEFT JOIN`. Removes 3.1 and 3.3 entirely.
@@ -307,13 +327,13 @@ improvements.
 
 ## 6. Summary
 
-The implementation is functionally complete for the happy path and has
-solid SQL regression coverage. The two correctness risks worth blocking
-on are:
+The implementation is now in much better shape than when this report was first
+written. The two most important remaining gaps are:
 
-- **P1 / P8 (idle / end-of-stream)** — bounded streams will silently lose
-  the trailing batch.
-- **NON-ASOF-1 (text-level normalizer false-trigger)** — ordinary queries
-  using `asof` as an identifier can fail to parse.
+- **P2 (TTL-bounded lookback)** — still needs stronger validation and
+  observability.
+- **P3 (linear candidate search)** — still needs a sorted/indexed right-side
+  structure for hot-key efficiency.
 
-The remaining items are tractable polish.
+Everything else in this document is either already fixed, significantly reduced,
+or downgraded after re-checking the implementation.

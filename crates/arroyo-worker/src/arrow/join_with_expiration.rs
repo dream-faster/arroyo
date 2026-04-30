@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use arrow::compute::{concat_batches, partition, sort_to_indices, take};
+use arrow::row::{RowConverter, SortField};
 use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampNanosecondType;
 use arrow_array::{Array, RecordBatch};
@@ -54,6 +55,8 @@ pub struct JoinWithExpiration {
     right_passer: Arc<RwLock<Option<RecordBatch>>>,
     join_execution_plan: Arc<dyn ExecutionPlan>,
     asof: Option<AsofConfig>,
+    pending_left_schema: ArroyoSchema,
+    task_ctx: Arc<datafusion::execution::context::TaskContext>,
 }
 
 impl JoinWithExpiration {
@@ -170,14 +173,13 @@ impl JoinWithExpiration {
         batch: RecordBatch,
         ctx: &mut OperatorContext,
     ) -> DataflowResult<()> {
-        let pending_schema = pending_left_schema(&self.left_input_schema, self.asof);
         let pending_left = ctx
             .table_manager
             .get_expiring_time_key_table("left_pending", ctx.last_present_watermark())
             .await?;
 
         let time_column = batch
-            .column(pending_schema.timestamp_index)
+            .column(self.pending_left_schema.timestamp_index)
             .as_any()
             .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             .ok_or_else(|| {
@@ -239,6 +241,10 @@ impl JoinWithExpiration {
     ) -> DataflowResult<()> {
         let cfg = self.asof.expect("asof config required");
         let empty_right = RecordBatch::new_empty(self.right_schema.schema.clone());
+        let right_table = ctx
+            .table_manager
+            .get_key_time_table("right", ctx.last_present_watermark())
+            .await?;
 
         for i in 0..batch.num_rows() {
             let keyed_row = batch.slice(i, 1);
@@ -257,10 +263,6 @@ impl JoinWithExpiration {
                 &self.left_key_converter,
             )?;
 
-            let right_table = ctx
-                .table_manager
-                .get_key_time_table("right", ctx.last_present_watermark())
-                .await?;
             let candidates = right_table.get_batch(&key_row)?.cloned();
 
             let best_right = match candidates {
@@ -300,7 +302,7 @@ impl JoinWithExpiration {
         self.join_execution_plan.reset().unwrap();
         let mut records = self
             .join_execution_plan
-            .execute(0, SessionContext::new().task_ctx())
+            .execute(0, self.task_ctx.clone())
             .expect("successfully computed?");
         while let Some(batch) = records.next().await {
             collector.collect(batch?).await?;
@@ -371,11 +373,8 @@ impl ArrowOperator for JoinWithExpiration {
             return Ok(Some(watermark));
         }
 
-        let Some(watermark_time) =
-            asof_finalize_watermark_time(watermark, ctx.last_present_watermark())
-        else {
-            return Ok(Some(watermark));
-        };
+        let finalize_action =
+            asof_finalize_watermark_action(watermark, ctx.last_present_watermark());
 
         loop {
             let next_time = {
@@ -389,8 +388,15 @@ impl ArrowOperator for JoinWithExpiration {
             let Some(next_time) = next_time else {
                 break;
             };
-            if next_time >= watermark_time {
-                break;
+            match finalize_action {
+                AsofFinalizeWatermarkAction::None => break,
+                AsofFinalizeWatermarkAction::Through(watermark_time)
+                    if next_time >= watermark_time =>
+                {
+                    break;
+                }
+                AsofFinalizeWatermarkAction::DrainAll | AsofFinalizeWatermarkAction::Through(_) => {
+                }
             }
 
             let batches = {
@@ -448,7 +454,7 @@ impl ArrowOperator for JoinWithExpiration {
                 left_table_description,
                 self.left_expiration,
                 false,
-                pending_left_schema(&self.left_input_schema, self.asof),
+                self.pending_left_schema.clone(),
             ),
         );
         tables.insert(
@@ -494,12 +500,12 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
         let left_schema = left_input_schema.schema_without_keys()?;
         let right_schema = right_input_schema.schema_without_keys()?;
         let left_key_converter = left_input_schema.converter(false)?;
+        let task_ctx = SessionContext::new().task_ctx();
 
-        let mut ttl = Duration::from_micros(
-            config
-                .ttl_micros
-                .expect("ttl must be set for non-instant join"),
-        );
+        let raw_ttl_micros = config
+            .ttl_micros
+            .expect("ttl must be set for non-instant join");
+        let mut ttl = Duration::from_micros(raw_ttl_micros);
 
         if ttl == Duration::ZERO {
             warn!("TTL was not set for join with expiration");
@@ -517,6 +523,14 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
             None
         };
 
+        if asof.is_some() && raw_ttl_micros == 0 {
+            warn!(
+                "ASOF JOIN TTL was not configured; defaulting to 24h which also bounds right-side ASOF lookback"
+            );
+        }
+
+        let pending_left_schema = pending_left_schema(&left_input_schema, asof);
+
         Ok(ConstructedOperator::from_operator(Box::new(
             JoinWithExpiration {
                 left_expiration: ttl,
@@ -530,24 +544,35 @@ impl OperatorConstructor for JoinWithExpirationConstructor {
                 right_passer,
                 join_execution_plan,
                 asof,
+                pending_left_schema,
+                task_ctx,
             },
         )))
     }
 }
 
-fn asof_finalize_watermark_time(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsofFinalizeWatermarkAction {
+    None,
+    Through(std::time::SystemTime),
+    DrainAll,
+}
+
+fn asof_finalize_watermark_action(
     watermark: Watermark,
     last_present_watermark: Option<std::time::SystemTime>,
-) -> Option<std::time::SystemTime> {
+) -> AsofFinalizeWatermarkAction {
     match watermark {
-        Watermark::EventTime(_) => last_present_watermark,
-        Watermark::Idle => None,
+        Watermark::EventTime(_) => last_present_watermark
+            .map(AsofFinalizeWatermarkAction::Through)
+            .unwrap_or(AsofFinalizeWatermarkAction::None),
+        Watermark::Idle => AsofFinalizeWatermarkAction::DrainAll,
     }
 }
 
 fn decode_asof_inequality(value: i32) -> anyhow::Result<api::AsofInequality> {
     api::AsofInequality::try_from(value)
-        .map_err(|_| anyhow!("invalid ASOF inequality enum value {value}"))
+        .map_err(|_| anyhow!("invalid JoinOperator.asof.inequality enum value {value}"))
 }
 
 fn pending_left_schema(schema: &ArroyoSchema, asof: Option<AsofConfig>) -> ArroyoSchema {
@@ -609,6 +634,16 @@ fn pick_asof_right(
             ))
         })?;
 
+    let row_converter = RowConverter::new(
+        candidates
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )?;
+    let rows = row_converter.convert_columns(candidates.columns())?;
+
     let mut best: Option<(usize, i64)> = None;
     for i in 0..ts.len() {
         if ts.is_null(i) {
@@ -626,13 +661,15 @@ fn pick_asof_right(
         }
 
         match (inequality, best) {
-            (api::AsofInequality::Gte, Some((_, b))) | (api::AsofInequality::Gt, Some((_, b)))
-                if b > v => {}
-            (api::AsofInequality::Lte, Some((_, b))) | (api::AsofInequality::Lt, Some((_, b)))
-                if b < v => {}
+            (api::AsofInequality::Gte, Some((best_idx, b)))
+            | (api::AsofInequality::Gt, Some((best_idx, b)))
+                if b > v || (b == v && rows.row(best_idx).as_ref() >= rows.row(i).as_ref()) => {}
+            (api::AsofInequality::Lte, Some((best_idx, b)))
+            | (api::AsofInequality::Lt, Some((best_idx, b)))
+                if b < v || (b == v && rows.row(best_idx).as_ref() >= rows.row(i).as_ref()) => {}
             _ => {
-                // Prefer the later row on ties so selection matches the final
-                // qualifying row in partition order.
+                // Break timestamp ties by the encoded row payload so selection is
+                // deterministic across batch replay and recovery.
                 best = Some((i, v));
             }
         }
@@ -757,10 +794,10 @@ mod tests {
     }
 
     #[test]
-    fn idle_watermark_does_not_trigger_asof_finalization() {
+    fn idle_watermark_drains_all_pending_left() {
         assert_eq!(
-            asof_finalize_watermark_time(Watermark::Idle, Some(from_nanos(5))),
-            None
+            asof_finalize_watermark_action(Watermark::Idle, Some(from_nanos(5))),
+            AsofFinalizeWatermarkAction::DrainAll
         );
     }
 
@@ -768,15 +805,15 @@ mod tests {
     fn event_time_watermark_uses_last_present_value() {
         let watermark = from_nanos(5);
         assert_eq!(
-            asof_finalize_watermark_time(Watermark::EventTime(watermark), Some(watermark)),
-            Some(watermark)
+            asof_finalize_watermark_action(Watermark::EventTime(watermark), Some(watermark)),
+            AsofFinalizeWatermarkAction::Through(watermark)
         );
     }
 
     #[test]
     fn rejects_unknown_asof_inequality_enum() {
         let err = decode_asof_inequality(-1).unwrap_err().to_string();
-        assert!(err.contains("invalid ASOF inequality"), "got {err}");
+        assert!(err.contains("JoinOperator.asof.inequality"), "got {err}");
     }
 
     #[test]

@@ -270,13 +270,15 @@ impl ArroyoSchemaProvider {
         // DataFusion's SQL → logical planning. The planner detects this call,
         // extracts the timestamp expressions, and removes the call before
         // physical planning. See `crate::asof`.
-        registry
-            .register_udf(Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
-                name: asof::ASOF_MARKER_UDF.to_string(),
-                signature: Signature::any(2, Volatility::Volatile),
-                return_type: Arc::new(|_| Ok(DataType::Boolean)),
-            })))
-            .unwrap();
+        for name in asof::asof_marker_udf_names() {
+            registry
+                .register_udf(Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
+                    name: name.to_string(),
+                    signature: Signature::any(2, Volatility::Volatile),
+                    return_type: Arc::new(|_| Ok(DataType::Boolean)),
+                })))
+                .unwrap();
+        }
         registry
             .register_udf(PlaceholderUdf::with_return(
                 "row_time",
@@ -790,9 +792,15 @@ fn try_handle_set_variable(
 
 pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
     asof::reject_user_authored_asof_marker(sql)?;
-    let normalized =
-        asof::normalize_duckdb_asof_left_joins(&asof::normalize_duckdb_asof_using_joins(sql)?)?;
-    let mut statements = Parser::parse_sql(&ArroyoDialect {}, &normalized)?;
+    let mut statements = match Parser::parse_sql(&ArroyoDialect {}, sql) {
+        Ok(statements) => statements,
+        Err(_) => {
+            let normalized = asof::normalize_duckdb_asof_left_joins(
+                &asof::normalize_duckdb_asof_using_joins(sql)?,
+            )?;
+            Parser::parse_sql(&ArroyoDialect {}, &normalized)?
+        }
+    };
     asof::rewrite_asof_joins(&mut statements)?;
     Ok(statements)
 }

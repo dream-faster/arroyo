@@ -11,8 +11,8 @@
 //!  - Before handing the AST to DataFusion (which does not support ASOF), we
 //!    rewrite each `JoinOperator::AsOf { match_condition, constraint }` into a
 //!    plain `JoinOperator::Inner` whose `ON` expression is
-//!    `<constraint> AND <match_condition> AND _arroyo_asof(<lhs>, <rhs>)`.
-//!  - `_arroyo_asof` is a placeholder UDF (always `TRUE`) that the planner
+//!    `<constraint> AND <match_condition> AND _arroyo_internal_asof_<op>(<lhs>, <rhs>)`.
+//!  - `_arroyo_internal_asof_<op>` is a placeholder UDF (always `TRUE`) that the planner
 //!    detects in the resulting `LogicalPlan::Join`'s filter, extracts the
 //!    timestamp arguments from, and uses to mark the join as ASOF.
 //!  - The runtime operator (`JoinWithExpiration`) then narrows each
@@ -31,15 +31,33 @@ use sqlparser::ast::{
 };
 use sqlparser::parser::ParserError;
 
-/// Marker UDF that the planner injects into the join `ON` expression to flag
-/// the join as ASOF and to carry the left/right timestamp expressions through
-/// DataFusion's SQL → logical plan stage.
-pub const ASOF_MARKER_UDF: &str = "_arroyo_asof";
+/// Prefix for planner-only marker UDFs that carry ASOF timestamp expressions
+/// and the inequality through DataFusion's SQL → logical plan stage.
+pub const ASOF_MARKER_UDF_PREFIX: &str = "__arroyo_internal_asof_";
+
+pub fn asof_marker_udf_name(op: BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::GtEq => "__arroyo_internal_asof_gte",
+        BinaryOperator::Gt => "__arroyo_internal_asof_gt",
+        BinaryOperator::LtEq => "__arroyo_internal_asof_lte",
+        BinaryOperator::Lt => "__arroyo_internal_asof_lt",
+        _ => unreachable!("unsupported ASOF marker inequality"),
+    }
+}
+
+pub fn asof_marker_udf_names() -> [&'static str; 4] {
+    [
+        asof_marker_udf_name(BinaryOperator::GtEq),
+        asof_marker_udf_name(BinaryOperator::Gt),
+        asof_marker_udf_name(BinaryOperator::LtEq),
+        asof_marker_udf_name(BinaryOperator::Lt),
+    ]
+}
 
 pub fn reject_user_authored_asof_marker(sql: &str) -> Result<(), ParserError> {
-    if find_function_call_outside(sql, ASOF_MARKER_UDF, 0).is_some() {
+    if find_function_call_outside(sql, ASOF_MARKER_UDF_PREFIX, 0).is_some() {
         return Err(ParserError::ParserError(format!(
-            "{ASOF_MARKER_UDF} is a reserved internal function name and cannot be called from user SQL"
+            "{ASOF_MARKER_UDF_PREFIX}* is a reserved internal function name pattern and cannot be called from user SQL"
         )));
     }
 
@@ -172,7 +190,7 @@ pub fn normalize_duckdb_asof_left_joins(sql: &str) -> Result<String, ParserError
         normalized.push_str(") AND (");
         normalized.push_str(match_condition.trim());
         normalized.push_str(") AND ");
-        normalized.push_str(ASOF_MARKER_UDF);
+        normalized.push_str(asof_marker_udf_name(BinaryOperator::GtEq));
         normalized.push('(');
         normalized.push_str(left_ts.trim());
         normalized.push_str(", ");
@@ -187,7 +205,7 @@ pub fn normalize_duckdb_asof_left_joins(sql: &str) -> Result<String, ParserError
 }
 
 /// Rewrite every `ASOF JOIN ... MATCH_CONDITION (...) ON (...)` in `statements`
-/// into a regular `INNER JOIN` whose ON expression carries an `_arroyo_asof`
+/// into a regular `INNER JOIN` whose ON expression carries an internal ASOF
 /// marker call.
 pub fn rewrite_asof_joins(statements: &mut [Statement]) -> Result<(), ParserError> {
     for stmt in statements.iter_mut() {
@@ -309,7 +327,11 @@ fn rewrite_join_operator(join: &mut Join) -> Result<(), ParserError> {
         }
     };
 
-    let marker = make_marker_call(lhs.clone(), rhs.clone());
+    let marker = make_marker_call(
+        lhs.clone(),
+        rhs.clone(),
+        match_condition_operator(match_condition)?,
+    );
     let combined = Expr::BinaryOp {
         left: Box::new(Expr::BinaryOp {
             left: Box::new(on_expr),
@@ -324,10 +346,19 @@ fn rewrite_join_operator(join: &mut Join) -> Result<(), ParserError> {
     Ok(())
 }
 
-fn make_marker_call(lhs: Expr, rhs: Expr) -> Expr {
+fn match_condition_operator(match_condition: &Expr) -> Result<BinaryOperator, ParserError> {
+    match match_condition {
+        Expr::BinaryOp { op, .. } => Ok(op.clone()),
+        other => Err(ParserError::ParserError(format!(
+            "ASOF JOIN MATCH_CONDITION must be a binary inequality comparison, got `{other}`"
+        ))),
+    }
+}
+
+fn make_marker_call(lhs: Expr, rhs: Expr, op: BinaryOperator) -> Expr {
     Expr::Function(Function {
         name: ObjectName(vec![ObjectNamePart::Identifier(
-            sqlparser::ast::Ident::new(ASOF_MARKER_UDF),
+            sqlparser::ast::Ident::new(asof_marker_udf_name(op)),
         )]),
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
@@ -378,10 +409,46 @@ fn find_keyword_outside(sql: &str, keyword: &str, start: usize) -> Option<usize>
     None
 }
 
-fn find_function_call_outside(sql: &str, function_name: &str, start: usize) -> Option<usize> {
-    let idx = find_keyword_outside(sql, function_name, start)?;
-    let next = skip_whitespace(sql, idx + function_name.len());
-    (sql.as_bytes().get(next) == Some(&b'(')).then_some(idx)
+fn find_function_call_outside(
+    sql: &str,
+    function_name_prefix: &str,
+    start: usize,
+) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let prefix_bytes = function_name_prefix.as_bytes();
+    let mut depth = 0i64;
+    let mut i = start;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while i < bytes.len() {
+        if depth == 0
+            && !in_single_quote
+            && !in_double_quote
+            && i + prefix_bytes.len() <= bytes.len()
+            && sql[i..i + prefix_bytes.len()].eq_ignore_ascii_case(function_name_prefix)
+            && is_word_boundary(bytes, i.saturating_sub(1))
+        {
+            let mut end = i + prefix_bytes.len();
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let next = skip_whitespace(sql, end);
+            if sql.as_bytes().get(next) == Some(&b'(') {
+                return Some(i);
+            }
+        }
+
+        i = advance_sql_position(
+            bytes,
+            i,
+            &mut depth,
+            &mut in_single_quote,
+            &mut in_double_quote,
+        );
+    }
+
+    None
 }
 
 fn relation_alias(segment: &str) -> Result<&str, ParserError> {
@@ -769,7 +836,7 @@ mod tests {
         assert!(normalized.contains("LEFT JOIN right_t r"), "{normalized}");
         assert!(!normalized.contains("ASOF LEFT JOIN"), "{normalized}");
         assert!(
-            normalized.contains("_arroyo_asof(l.ts, r.ts)"),
+            normalized.contains("__arroyo_internal_asof_gte(l.ts, r.ts)"),
             "{normalized}"
         );
         assert!(
@@ -814,7 +881,7 @@ mod tests {
     #[test]
     fn rejects_user_authored_marker_call() {
         let err = reject_user_authored_asof_marker(
-            "SELECT * FROM l JOIN r ON _arroyo_asof(l._timestamp, r._timestamp)",
+            "SELECT * FROM l JOIN r ON __arroyo_internal_asof_gte(l._timestamp, r._timestamp)",
         )
         .unwrap_err()
         .to_string();
@@ -846,8 +913,9 @@ mod tests {
             "expected `ASOF JOIN` syntax to be removed, got {s}"
         );
         assert!(
-            s.contains(ASOF_MARKER_UDF),
-            "expected `{ASOF_MARKER_UDF}` marker call, got {s}"
+            s.contains(asof_marker_udf_name(BinaryOperator::GtEq)),
+            "expected `{}` marker call, got {s}",
+            asof_marker_udf_name(BinaryOperator::GtEq)
         );
         // The original equi- and match-conditions must still be present.
         assert!(s.contains("l.k = r.k"), "got {s}");
@@ -860,7 +928,10 @@ mod tests {
         let out = rewrite(sql).unwrap();
         let s = rendered(&out);
         assert!(s.contains("l.ts > r.ts"), "got {s}");
-        assert!(s.contains(ASOF_MARKER_UDF), "got {s}");
+        assert!(
+            s.contains(asof_marker_udf_name(BinaryOperator::Gt)),
+            "got {s}"
+        );
     }
 
     #[test]
@@ -869,7 +940,10 @@ mod tests {
         let out = rewrite(sql).unwrap();
         let s = rendered(&out);
         assert!(s.contains("l.ts <= r.ts"), "got {s}");
-        assert!(s.contains(ASOF_MARKER_UDF), "got {s}");
+        assert!(
+            s.contains(asof_marker_udf_name(BinaryOperator::LtEq)),
+            "got {s}"
+        );
     }
 
     #[test]
@@ -878,7 +952,10 @@ mod tests {
         let out = rewrite(sql).unwrap();
         let s = rendered(&out);
         assert!(s.contains("l.ts < r.ts"), "got {s}");
-        assert!(s.contains(ASOF_MARKER_UDF), "got {s}");
+        assert!(
+            s.contains(asof_marker_udf_name(BinaryOperator::Lt)),
+            "got {s}"
+        );
     }
 
     #[test]
@@ -903,7 +980,8 @@ mod tests {
         let out = rewrite(sql).unwrap();
         let s = rendered(&out);
         assert!(
-            s.contains(ASOF_MARKER_UDF) && !s.to_uppercase().contains("ASOF JOIN"),
+            s.contains(asof_marker_udf_name(BinaryOperator::GtEq))
+                && !s.to_uppercase().contains("ASOF JOIN"),
             "expected CTE ASOF to be rewritten, got: {s}"
         );
 
@@ -913,7 +991,8 @@ mod tests {
         let out2 = rewrite(sql2).unwrap();
         let s2 = rendered(&out2);
         assert!(
-            s2.contains(ASOF_MARKER_UDF) && !s2.to_uppercase().contains("ASOF JOIN"),
+            s2.contains(asof_marker_udf_name(BinaryOperator::GtEq))
+                && !s2.to_uppercase().contains("ASOF JOIN"),
             "expected subquery ASOF to be rewritten, got: {s2}"
         );
     }
@@ -924,7 +1003,7 @@ mod tests {
         let out = rewrite(sql).unwrap();
         let s = rendered(&out);
         assert!(
-            !s.contains(ASOF_MARKER_UDF),
+            !s.contains(ASOF_MARKER_UDF_PREFIX),
             "non-ASOF joins must not get a marker, got: {s}"
         );
     }

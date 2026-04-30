@@ -10,14 +10,19 @@ join with a private marker UDF, carrying timestamp column indexes through the
 planner, and enforcing "nearest right timestamp <= left timestamp" in
 `JoinWithExpiration`.
 
-The approach is directionally workable, and the existing PR CI is green.
-However, the current runtime semantics are not safe for normal streaming ASOF
-usage unless the join is explicitly documented as arrival-order/speculative.
-Late or out-of-order right rows can cause duplicate outputs for the same left
-row, and equal-timestamp right ties can emit rows that are not the deterministic
-"best" candidate. There are also validation gaps that push user-facing errors
-to runtime and a compatibility risk if planners with `asof` jobs talk to older
-workers.
+The branch is now materially safer than the initial review version. Follow-up
+changes moved runtime execution to final-event-time semantics by buffering left
+rows until watermark finalization, draining pending left rows on `Idle`,
+encoding the ASOF inequality in the internal marker name, rejecting
+user-authored marker calls, preferring raw parsing before ASOF-specific SQL
+normalization, and making equal-timestamp tie-breaking deterministic.
+
+The main remaining concerns are now narrower:
+
+- ASOF lookback is still bounded by join TTL with only a runtime warning.
+- Timestamp type validation still mostly happens at runtime rather than during
+  planning.
+- Candidate selection is still linear in the number of right rows for a key.
 
 After researching DuckDB's current documentation, tests, binder, and physical
 operator, the compatibility target should be updated: Arroyo should match
@@ -37,6 +42,22 @@ The detailed compatibility spec is now captured in
 `docs/duckdb-asof-compatibility-spec.md`, and the DuckDB-compatible resolution
 plan appended below supersedes the earlier local-semantic plan where they
 conflict.
+
+## Status update after the follow-up fixes
+
+This report started as a pre-implementation audit. Several of its original
+findings have now been addressed directly in code:
+
+| Original finding | Current status | What changed |
+| --- | --- | --- |
+| 1. Late right rows can change a previously emitted ASOF match without a retraction | **Resolved** | Left rows are buffered and only finalized against right state on watermark / idle finalization, so the operator emits one final result rather than speculative early matches. |
+| 2. Equal-timestamp ties can emit the wrong row and duplicate outputs | **Resolved** | Tie-breaking is now deterministic and keyed off encoded row payload rather than a timestamp-only equality check. |
+| 3. The marker UDF is user-callable | **Resolved** | The marker name moved to the reserved internal `__arroyo_internal_asof_*` namespace and user-authored calls are rejected before parsing. |
+| 4. Runtime timestamp validation is too late and has inconsistent null behavior | **Partially resolved** | Runtime behavior is safer (null-left rows no longer crash the operator path), but planner-time type validation is still missing. |
+| 5. Candidate selection is O(left_rows_for_key * right_rows_for_key) on right input | **Still open** | This review pass improved a few constant factors, but the core hot-key complexity is still linear in right rows per left lookup. |
+
+The detailed sections below are preserved for context, but the table above is
+the current status.
 
 ## High-priority failure modes
 

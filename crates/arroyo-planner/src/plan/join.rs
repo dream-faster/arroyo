@@ -1,4 +1,4 @@
-use crate::asof::ASOF_MARKER_UDF;
+use crate::asof::ASOF_MARKER_UDF_PREFIX;
 use crate::extension::join::{AsofConfig, JoinExtension};
 use crate::extension::key_calculation::KeyCalculationExtension;
 use crate::extension::lookup::{LookupJoin, LookupSource};
@@ -330,7 +330,7 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
             return Ok(Transformed::yes(plan));
         }
 
-        // Detect and consume an ASOF marker (`_arroyo_asof(left_ts, right_ts)`)
+        // Detect and consume an ASOF marker (`__arroyo_internal_asof_<op>(left_ts, right_ts)`)
         // injected by the AST pre-pass in `crate::asof`. If found, capture the
         // timestamp expressions and remove the marker from the join's filter.
         let (asof_marker, filter_without_marker) = take_asof_marker(join.filter.clone())?;
@@ -369,8 +369,11 @@ impl TreeNodeRewriter for JoinRewriter<'_> {
         let mut right_expressions = on.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
 
         if is_asof {
-            let null_safe_keys =
-                extract_null_safe_join_keys(join.filter.as_ref(), left.schema(), right.schema())?;
+            let null_safe_keys = extract_null_safe_join_keys(
+                filter_without_marker.as_ref(),
+                left.schema(),
+                right.schema(),
+            )?;
             left_expressions.extend(null_safe_keys.iter().map(|(l, _)| l.clone()));
             right_expressions.extend(null_safe_keys.into_iter().map(|(_, r)| r));
         }
@@ -479,19 +482,23 @@ fn extract_null_safe_join_keys(
 
 type AsofExtractedFilter = (Option<(Expr, Expr, AsofInequality)>, Option<Expr>);
 
-/// If `filter` contains exactly one `_arroyo_asof(left_ts, right_ts)` call,
-/// extract the two argument expressions, recover the associated inequality
-/// operator from the filter, and return the filter with the marker stripped out
-/// (replaced by `TRUE`, then constant-folded).
+/// If `filter` contains exactly one `__arroyo_internal_asof_<op>(left_ts, right_ts)` call,
+/// extract the two argument expressions and associated inequality, then return
+/// the filter with the marker stripped out (replaced by `TRUE`, then
+/// constant-folded).
 fn take_asof_marker(filter: Option<Expr>) -> Result<AsofExtractedFilter> {
     let Some(filter) = filter else {
         return Ok((None, None));
     };
 
-    let mut found: Option<(Expr, Expr)> = None;
+    if !contains_asof_marker(&filter) {
+        return Ok((None, Some(filter)));
+    }
+
+    let mut found: Option<(Expr, Expr, AsofInequality)> = None;
     let transformed = filter.clone().transform_up(&mut |e: Expr| {
         if let Expr::ScalarFunction(ScalarFunction { func, args }) = &e
-            && func.name() == ASOF_MARKER_UDF
+            && let Some(inequality) = marker_inequality(func.name())
         {
             if found.is_some() {
                 return Err(DataFusionError::Plan(
@@ -500,10 +507,10 @@ fn take_asof_marker(filter: Option<Expr>) -> Result<AsofExtractedFilter> {
             }
             if args.len() != 2 {
                 return Err(DataFusionError::Plan(format!(
-                    "{ASOF_MARKER_UDF} marker must have exactly 2 arguments"
+                    "{ASOF_MARKER_UDF_PREFIX}* marker must have exactly 2 arguments"
                 )));
             }
-            found = Some((args[0].clone(), args[1].clone()));
+            found = Some((args[0].clone(), args[1].clone(), inequality));
             return Ok(Transformed::yes(Expr::Literal(
                 ScalarValue::Boolean(Some(true)),
                 None,
@@ -512,19 +519,25 @@ fn take_asof_marker(filter: Option<Expr>) -> Result<AsofExtractedFilter> {
         Ok(Transformed::no(e))
     })?;
 
-    let inequality = if let Some((left, right)) = &found {
-        Some(find_asof_inequality(&filter, left, right)?)
-    } else {
-        None
-    };
-
-    let found = match (found, inequality) {
-        (Some((left, right)), Some(inequality)) => Some((left, right, inequality)),
-        _ => None,
-    };
-
     let stripped = simplify_trivial_and(transformed.data);
     Ok((found, stripped))
+}
+
+fn contains_asof_marker(filter: &Expr) -> bool {
+    let mut found = false;
+    filter
+        .apply(|expr| {
+            if let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr
+                && marker_inequality(func.name()).is_some()
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("expression walk should not fail");
+    found
 }
 
 /// Drops `AND TRUE` / `TRUE AND` and reduces a top-level `Literal(true)` filter
@@ -550,41 +563,14 @@ fn simplify_trivial_and(expr: Expr) -> Option<Expr> {
     }
 }
 
-fn find_asof_inequality(filter: &Expr, left: &Expr, right: &Expr) -> Result<AsofInequality> {
-    let mut found = None;
-    filter.apply(|expr| {
-        if let Expr::BinaryExpr(BinaryExpr {
-            left: l,
-            op,
-            right: r,
-        }) = expr
-            && **l == *left
-            && **r == *right
-        {
-            let inequality = match op {
-                Operator::GtEq => Some(AsofInequality::Gte),
-                Operator::Gt => Some(AsofInequality::Gt),
-                Operator::LtEq => Some(AsofInequality::Lte),
-                Operator::Lt => Some(AsofInequality::Lt),
-                _ => None,
-            };
-            if let Some(inequality) = inequality
-                && found.replace(inequality).is_some()
-            {
-                return Err(DataFusionError::Plan(
-                    "multiple ASOF inequalities in a single join are not supported".to_string(),
-                ));
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-
-    found.ok_or_else(|| {
-        DataFusionError::Plan(
-            "ASOF JOIN marker was present but matching inequality could not be recovered"
-                .to_string(),
-        )
-    })
+fn marker_inequality(name: &str) -> Option<AsofInequality> {
+    match name {
+        "__arroyo_internal_asof_gte" => Some(AsofInequality::Gte),
+        "__arroyo_internal_asof_gt" => Some(AsofInequality::Gt),
+        "__arroyo_internal_asof_lte" => Some(AsofInequality::Lte),
+        "__arroyo_internal_asof_lt" => Some(AsofInequality::Lt),
+        _ => None,
+    }
 }
 
 /// Validate ASOF join restrictions: inner/left join, no windows, non-updating.
@@ -651,5 +637,26 @@ mod tests {
         assert!(matches!(keys[0].1, Expr::IsNull(_)));
         assert!(format!("{}", keys[1].0).contains("Utf8"));
         assert!(format!("{}", keys[1].1).contains("Utf8"));
+    }
+
+    #[test]
+    fn decodes_marker_inequality_from_name() {
+        assert_eq!(
+            marker_inequality("__arroyo_internal_asof_gte"),
+            Some(AsofInequality::Gte)
+        );
+        assert_eq!(
+            marker_inequality("__arroyo_internal_asof_gt"),
+            Some(AsofInequality::Gt)
+        );
+        assert_eq!(
+            marker_inequality("__arroyo_internal_asof_lte"),
+            Some(AsofInequality::Lte)
+        );
+        assert_eq!(
+            marker_inequality("__arroyo_internal_asof_lt"),
+            Some(AsofInequality::Lt)
+        );
+        assert_eq!(marker_inequality("other_udf"), None);
     }
 }
