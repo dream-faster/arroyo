@@ -345,3 +345,320 @@ cargo test -p arroyo-worker arrow::join_with_expiration::tests --quiet
 ```
 
 It failed before compiling the crate with Cargo's edition-2024 feature error.
+
+## Exact resolution plan
+
+Target semantics: implement ASOF JOIN as a **final event-time join**. For each
+left row, emit at most one output row after the join can know that no earlier
+or equal-key right row with a timestamp closer to the left timestamp can still
+arrive. Do not emit speculative rows and do not require downstream retractions.
+
+### Phase 1: Lock the semantic contract in tests
+
+Files to update:
+
+- `crates/arroyo-planner/src/test/queries/asof_join.sql`
+- `crates/arroyo-planner/src/test/queries/asof_join_multi_key.sql`
+- new planner negative query files under
+  `crates/arroyo-planner/src/test/queries/`
+- worker/runtime tests in
+  `crates/arroyo-worker/src/arrow/join_with_expiration.rs`, or integration
+  tests under `crates/integ` if the operator harness cannot express the cases
+  below directly
+
+Steps:
+
+1. Add a test where right `R1(k=A, ts=10)` arrives, left `L(k=A, ts=20)`
+   arrives, then right `R2(k=A, ts=15)` arrives before the right-side watermark
+   passes `20`. Expected result: only `L-R2` is emitted, and `L-R1` is never
+   emitted.
+2. Add a test where right `R1(k=A, ts=10)` arrives, left `L(k=A, ts=20)`
+   arrives, the right-side watermark passes `20`, then right `R2(k=A, ts=15)`
+   arrives. Expected result: only `L-R1` is emitted; `R2` is late relative to
+   the finalized left row and must not create a second output.
+3. Add a duplicate-timestamp tie test: right `R1(k=A, ts=10, quote_id=1)`,
+   right `R2(k=A, ts=10, quote_id=2)`, left `L(k=A, ts=12)`. Expected result:
+   exactly one output according to the selected tie-breaker from Phase 2.
+4. Add a multi-key test with out-of-order right rows to verify that only rows
+   with the same full key tuple are candidates.
+5. Add planner negative tests for:
+   - user-authored `_arroyo_asof(...)` in a normal join;
+   - non-timestamp `MATCH_CONDITION` columns;
+   - nullable timestamp match columns if nullable ASOF timestamps are rejected;
+   - `ON true`, `ON t.k <> q.k`, and ASOF joins with no extractable equality
+     key;
+   - parenthesized/nested ASOF joins.
+
+Acceptance criteria:
+
+- These tests fail against the current PR implementation for the duplicate and
+  late-right-row cases.
+- The expected output cardinality is asserted, not only that some matching row
+  appears.
+
+### Phase 2: Define deterministic candidate ordering
+
+Files to update:
+
+- `crates/arroyo-rpc/proto/api.proto`
+- generated proto outputs, if this repository checks them in
+- `crates/arroyo-planner/src/extension/join.rs`
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+
+Steps:
+
+1. Choose the tie-breaker: use **earliest right arrival wins** for rows with the
+   same ASOF timestamp unless product requirements explicitly require another
+   ordering. This is stable with append-only state and avoids changing a
+   finalized result when an equal-timestamp right row arrives later.
+2. Extend ASOF right-state rows with an internal monotonically increasing
+   arrival sequence per task. The sequence must be stored with state so
+   checkpoint/restore preserves the tie-break.
+3. Replace `pick_asof_right(candidates, right_ts_index, left_ts)` with a helper
+   that returns the candidate with the maximum tuple
+   `(right_ts <= left_ts, right_ts, -arrival_sequence)` for earliest-arrival
+   ties.
+4. Return a candidate identity from the helper, not only an index. The identity
+   should include at least timestamp plus arrival sequence.
+5. Remove timestamp-only duplicate checks such as `best_ts != new_right_ts`.
+   Candidate identity comparison must be used everywhere a "new best" check is
+   needed.
+
+Acceptance criteria:
+
+- Equal-timestamp right rows produce exactly one output per left row.
+- Replaying from a checkpoint produces the same selected right row as a fresh
+  run.
+
+### Phase 3: Rework runtime emission around watermarks
+
+Files to update:
+
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+- state table definitions in `crates/arroyo-state` if an additional pending
+  left table or indexed right table is required
+- `crates/arroyo-rpc/proto/api.proto` if new operator config is needed
+
+Steps:
+
+1. Stop emitting ASOF results directly from `process_left_asof`.
+2. Stop emitting ASOF results directly from `process_right_asof`.
+3. Insert right rows into keyed right state with their ASOF timestamp and arrival
+   sequence.
+4. Insert left rows into a pending-left state keyed by the equality-key tuple and
+   ordered by left ASOF timestamp.
+5. Implement `ArrowOperator::handle_watermark` for `JoinWithExpiration` when
+   `self.asof.is_some()`.
+6. On each event-time watermark, drain pending left rows whose left ASOF
+   timestamp is strictly less than the watermark chosen for finalization. This
+   matches the existing operator pattern that leaves rows at the watermark
+   itself open until a later watermark. If Arroyo exposes only a combined input
+   watermark to the operator, document and use that combined watermark; if
+   side-specific watermarks are available or can be added, use the right-side
+   watermark for ASOF finalization.
+7. For each drained left row, find the best right candidate with the same key
+   and `right_ts <= left_ts`, using the deterministic helper from Phase 2.
+8. Emit the joined pair only once, during watermark draining. If no right
+   candidate exists, emit nothing for inner ASOF JOIN.
+9. Ensure regular non-ASOF `JoinWithExpiration` behavior is unchanged by
+   branching all new logic on `self.asof`.
+10. Keep TTL cleanup aligned with finalization: a right row may be evicted only
+    after no future pending or not-yet-arrived left row can need it under the
+    configured lateness/retention policy.
+
+Acceptance criteria:
+
+- Late right rows that arrive before finalization can improve the selected
+  match.
+- Late right rows that arrive after finalization do not duplicate outputs.
+- Each left row produces zero or one output for inner ASOF JOIN.
+- Existing non-ASOF updating join tests remain unchanged.
+
+### Phase 4: Move ASOF validation into the planner
+
+Files to update:
+
+- `crates/arroyo-planner/src/asof.rs`
+- `crates/arroyo-planner/src/plan/join.rs`
+- `crates/arroyo-planner/src/lib.rs`
+- planner query tests under `crates/arroyo-planner/src/test/queries/`
+
+Steps:
+
+1. In `check_asof_join`, validate that the join type is inner, both inputs are
+   unwindowed, and the ASOF join has at least one equality key.
+2. Validate that `MATCH_CONDITION` arguments resolve to columns from opposite
+   sides of the join in the expected direction: `left_ts >= right_ts`.
+3. Validate that both ASOF timestamp columns have Arrow type
+   `Timestamp(Nanosecond, None)` or add an explicit normalization step before
+   planning the runtime operator.
+4. Decide nullability policy. Recommended policy: reject nullable ASOF
+   timestamp columns during planning for the first implementation. If nullable
+   timestamps must be supported, implement SQL-compatible behavior where nulls
+   simply do not match.
+5. Replace generic errors such as "Updating joins must include an equijoin
+   condition" with ASOF-specific diagnostics when the marker is present.
+6. Add tests that assert the exact ASOF-specific error messages.
+
+Acceptance criteria:
+
+- Invalid ASOF SQL fails before worker execution.
+- Error messages mention ASOF and the violated rule.
+
+### Phase 5: Remove or harden the SQL marker UDF
+
+Files to update:
+
+- `crates/arroyo-planner/src/asof.rs`
+- `crates/arroyo-planner/src/lib.rs`
+- `crates/arroyo-planner/src/plan/join.rs`
+
+Steps:
+
+1. Prefer replacing `_arroyo_asof` with a planner-only annotation that cannot be
+   typed by users. If DataFusion requires the marker-expression approach, keep
+   the marker private by adding a pre-rewrite scan that rejects any
+   user-authored `_arroyo_asof` call in the original SQL AST.
+2. Make the ASOF rewriter produce a marker that includes an internal planning
+   token or source-location flag so `take_asof_marker` can distinguish generated
+   markers from user SQL.
+3. Ensure `_arroyo_asof` is not exposed as a documented or callable user
+   function. If it must remain registered with DataFusion, return a clear plan
+   error for any marker not produced by the ASOF rewriter.
+4. Add a negative test for a normal inner join that contains
+   `_arroyo_asof(l.ts, r.ts)` in its `ON` predicate.
+
+Acceptance criteria:
+
+- User SQL cannot opt into ASOF behavior except through `ASOF JOIN ...
+  MATCH_CONDITION`.
+- The planner never silently strips user-authored predicates.
+
+### Phase 6: Complete AST rewrite recursion
+
+Files to update:
+
+- `crates/arroyo-planner/src/asof.rs`
+
+Steps:
+
+1. Extend `rewrite_table_factor` to recurse into every `TableFactor` variant
+   that can contain a subquery, nested join, table function argument, or derived
+   relation.
+2. Add tests for:
+   - `(l ASOF JOIN r MATCH_CONDITION (...) ON ...)`;
+   - `a JOIN (l ASOF JOIN r MATCH_CONDITION (...) ON ...) ON ...`;
+   - ASOF inside CTEs and derived subqueries, preserving the existing coverage;
+   - ASOF inside both sides of set operations, preserving the existing coverage.
+3. If a `sqlparser` table-factor variant cannot be supported, reject it with a
+   clear ASOF-specific parser/planner error instead of letting an unrevised
+   `JoinOperator::AsOf` reach DataFusion.
+
+Acceptance criteria:
+
+- Every ASOF syntax form accepted by `sqlparser` is either rewritten or rejected
+  with an ASOF-specific diagnostic before DataFusion planning.
+
+### Phase 7: Strengthen planner/runtime schema contracts
+
+Files to update:
+
+- `crates/arroyo-rpc/proto/api.proto`
+- `crates/arroyo-planner/src/extension/join.rs`
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+- `crates/arroyo-rpc/src/df.rs` tests, if present
+
+Steps:
+
+1. Extend `AsofJoinConfig` to include timestamp field names or stable field
+   identifiers in addition to numeric indexes.
+2. At worker construction, validate that `left_ts_index` and `right_ts_index`
+   are in bounds and that the indexed fields match the expected names and
+   timestamp data types.
+3. Add a keyed-schema test where key columns appear before, between, and after
+   payload columns. Verify that `ArroyoSchema::unkeyed_batch` and the planner's
+   ASOF indexes identify the same timestamp fields.
+4. Keep backward-compatible proto numbering by only adding new fields with new
+   field numbers; do not renumber existing fields.
+
+Acceptance criteria:
+
+- A schema/index mismatch fails during operator construction with a clear error.
+- Future key-layout changes cannot silently point ASOF at the wrong column.
+
+### Phase 8: Add compatibility gating
+
+Files to update:
+
+- planner-to-worker deployment or program validation code that already handles
+  operator capabilities
+- `crates/arroyo-rpc/proto/api.proto` if explicit operator capability metadata
+  is needed
+- CI or integration tests that can exercise mixed-version behavior
+
+Steps:
+
+1. Introduce an ASOF JOIN worker capability bit or minimum worker protocol
+   version.
+2. When a planned program contains `JoinOperator.asof`, require every target
+   worker to advertise that capability before scheduling the job.
+3. If capability negotiation is not available yet, encode ASOF as a distinct
+   operator/config version that older workers fail to decode rather than
+   silently interpreting as a regular inequality join.
+4. Add a compatibility test that decodes an ASOF join config without ASOF
+   support and verifies fail-fast behavior.
+
+Acceptance criteria:
+
+- An ASOF plan cannot run on a worker that would ignore field 7 and emit all
+  inequality matches.
+
+### Phase 9: Improve per-key state access for scale
+
+Files to update:
+
+- `crates/arroyo-state/src/tables/expiring_time_key_map.rs`
+- `crates/arroyo-worker/src/arrow/join_with_expiration.rs`
+
+Steps:
+
+1. Add an ASOF-specific state access path that stores right rows per equality
+   key ordered by `(right_ts, arrival_sequence)`.
+2. Add a lookup API that returns the greatest right row with
+   `right_ts <= left_ts` using binary search or an ordered map.
+3. Add a pending-left drain API that can iterate left rows up to a watermark
+   without scanning all rows for hot keys.
+4. Keep the existing `KeyTimeView::get_batch` API unchanged for non-ASOF joins.
+5. Add a stress test or benchmark with one hot key and many right candidates.
+
+Acceptance criteria:
+
+- Right-arrival and watermark-drain work is proportional to affected rows, not
+  `left_rows_for_key * right_rows_for_key`.
+- Non-ASOF state table behavior remains unchanged.
+
+### Phase 10: Final verification and rollout checklist
+
+Commands to run before merging the implementation:
+
+```text
+cargo fmt -- --check
+cargo clippy --all-targets --workspace -- -D warnings
+cargo nextest run -E 'kind(lib)'
+cargo build
+```
+
+Additional checks:
+
+1. Run the planner SQL regression suite that covers
+   `crates/arroyo-planner/src/test/queries/*.sql`.
+2. Run integration tests for both Postgres and SQLite metadata backends because
+   CI exercises both variants.
+3. Confirm PR checks show no failing Rust, integration, or format jobs.
+4. Manually inspect generated physical plans for a representative ASOF query to
+   confirm the marker predicate is removed before execution and the ASOF config
+   is present.
+5. Confirm the user-facing documentation states the exact semantics:
+   event-time-final ASOF, inner joins only, `>=` only, unwindowed inputs only,
+   deterministic equal-timestamp tie-breaker, timestamp type/nullability rules,
+   and worker version requirement.
