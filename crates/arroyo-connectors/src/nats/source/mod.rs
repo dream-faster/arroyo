@@ -366,8 +366,12 @@ impl NatsSourceFunc {
                                     let message_info = msg.info().expect("Couldn't get message information");
                                     let timestamp = message_info.published.into() ;
                                     if flatbuffers {
-                                        for batch in decode_flatbuffers_message(payload)
-                                            .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
+                                        for batch in decode_flatbuffers_message(
+                                            payload,
+                                            Some(collector.out_schema.schema.as_ref()),
+                                            Some(timestamp),
+                                        )
+                                        .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
                                         {
                                             collector.collect(batch).await?;
                                         }
@@ -490,8 +494,12 @@ impl NatsSourceFunc {
                                     let payload = msg.payload.as_ref();
                                     let timestamp = SystemTime::now();
                                     if flatbuffers {
-                                        for batch in decode_flatbuffers_message(payload)
-                                            .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
+                                        for batch in decode_flatbuffers_message(
+                                            payload,
+                                            Some(collector.out_schema.schema.as_ref()),
+                                            Some(timestamp),
+                                        )
+                                        .map_err(|e| connector_err!(External, WithBackoff, source: e, "failed to decode NATS flatbuffers payload"))?
                                         {
                                             collector.collect(batch).await?;
                                         }

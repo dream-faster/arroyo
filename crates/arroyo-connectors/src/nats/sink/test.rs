@@ -43,7 +43,7 @@ fn flatbuffers_sink_messages_roundtrip() {
     .unwrap();
 
     let message = encode_flatbuffers_message(&batch).unwrap();
-    let decoded = crate::nats::decode_flatbuffers_message(&message).unwrap();
+    let decoded = crate::nats::decode_flatbuffers_message(&message, None, None).unwrap();
 
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].schema(), batch.schema());
