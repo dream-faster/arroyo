@@ -3,6 +3,7 @@ use crate::nats::source::NatsSourceFunc;
 use anyhow::anyhow;
 use anyhow::bail;
 use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arroyo_operator::connector::{Connection, Connector};
@@ -22,6 +23,7 @@ use std::num::NonZeroU32;
 use tokio::sync::mpsc::Sender;
 use typify::import_types;
 
+mod mdv1;
 pub mod sink;
 pub mod source;
 
@@ -389,9 +391,18 @@ pub(crate) fn encode_flatbuffers_message(batch: &RecordBatch) -> anyhow::Result<
     Ok(bytes.into_inner())
 }
 
-pub(crate) fn decode_flatbuffers_message(msg: &[u8]) -> anyhow::Result<Vec<RecordBatch>> {
-    let reader = StreamReader::try_new(Cursor::new(msg), None)?;
-    reader.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+pub(crate) fn decode_flatbuffers_message(
+    msg: &[u8],
+    schema: Option<&Schema>,
+    metadata_timestamp: Option<std::time::SystemTime>,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    match StreamReader::try_new(Cursor::new(msg), None) {
+        Ok(reader) => reader.collect::<Result<Vec<_>, _>>().map_err(Into::into),
+        Err(arrow_error) if mdv1::is_mdv1_message(msg) => {
+            Ok(vec![mdv1::decode_message(msg, schema, metadata_timestamp)?])
+        }
+        Err(arrow_error) => Err(arrow_error.into()),
+    }
 }
 
 async fn get_nats_client(connection: &NatsConfig) -> anyhow::Result<async_nats::Client> {
