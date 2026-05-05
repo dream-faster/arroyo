@@ -4,7 +4,7 @@ use super::NatsConfig;
 use super::NatsState;
 use super::NatsTable;
 use super::ReplayPolicy;
-use super::{SourceType, get_nats_client};
+use super::{SourceType, get_nats_client, normalize_consumer_rate_limit};
 use arroyo_operator::SourceFinishType;
 use arroyo_operator::context::{SourceCollector, SourceContext};
 use arroyo_operator::operator::SourceOperator;
@@ -232,7 +232,7 @@ impl NatsSourceFunc {
                 ack_wait: Duration::from_secs(*ack_wait as u64),
                 description: description.clone(),
                 filter_subjects: filter_subjects.clone(),
-                rate_limit: *rate_limit as u64,
+                rate_limit: normalize_consumer_rate_limit(*rate_limit) as u64,
                 sample_frequency: *sample_frequency as u8,
                 num_replicas: *num_replicas as usize,
                 inactive_threshold: Duration::from_secs(*inactive_threshold as u64),

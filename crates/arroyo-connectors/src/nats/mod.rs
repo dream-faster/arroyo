@@ -25,6 +25,10 @@ const CONFIG_SCHEMA: &str = include_str!("./profile.json");
 const TABLE_SCHEMA: &str = include_str!("./table.json");
 const ICON: &str = include_str!("./nats.svg");
 
+pub(super) fn normalize_consumer_rate_limit(rate_limit: i64) -> i64 {
+    rate_limit.max(0)
+}
+
 import_types!(
     schema = "src/nats/profile.json",
     convert = {
@@ -103,7 +107,9 @@ impl NatsConnector {
                         inactive_threshold: options
                             .pull_opt_i64("consumer.inactive_threshold")?
                             .unwrap_or(600),
-                        rate_limit: options.pull_opt_i64("consumer.rate_limit")?.unwrap_or(-1),
+                        rate_limit: normalize_consumer_rate_limit(
+                            options.pull_opt_i64("consumer.rate_limit")?.unwrap_or(-1),
+                        ),
                         max_ack_pending: options
                             .pull_opt_i64("consumer.max_ack_pending")?
                             .unwrap_or(-1),
@@ -402,4 +408,21 @@ async fn get_nats_client(connection: &NatsConfig) -> anyhow::Result<async_nats::
         .await
         .map_err(|e| anyhow!("Failed to connect to nats: {:?}", e))?;
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_consumer_rate_limit;
+
+    #[test]
+    fn normalize_consumer_rate_limit_disables_negative_values() {
+        assert_eq!(normalize_consumer_rate_limit(-1), 0);
+        assert_eq!(normalize_consumer_rate_limit(-42), 0);
+    }
+
+    #[test]
+    fn normalize_consumer_rate_limit_preserves_explicit_limits() {
+        assert_eq!(normalize_consumer_rate_limit(0), 0);
+        assert_eq!(normalize_consumer_rate_limit(1024), 1024);
+    }
 }
