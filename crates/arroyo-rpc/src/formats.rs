@@ -285,13 +285,22 @@ impl AvroFormat {
     }
 
     pub fn from_opts(opts: &mut ConnectorOptions) -> DFResult<Self> {
-        Ok(Self::new(
+        let mut format = Self::new(
             opts.pull_opt_bool("avro.confluent_schema_registry")?
                 .unwrap_or(false),
             opts.pull_opt_bool("avro.raw_datums")?.unwrap_or(false),
             opts.pull_opt_bool("avro.into_unstructured_json")?
                 .unwrap_or(false),
-        ))
+        );
+
+        if let Some(reader_schema) = opts.pull_opt_str("avro.reader_schema")? {
+            let schema = apache_avro::Schema::parse_str(&reader_schema).map_err(|e| {
+                plan_datafusion_err!("invalid value for `avro.reader_schema`: {e:?}")
+            })?;
+            format.add_reader_schema(schema);
+        }
+
+        Ok(format)
     }
 
     pub fn add_reader_schema(&mut self, schema: apache_avro::Schema) {
