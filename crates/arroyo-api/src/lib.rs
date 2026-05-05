@@ -334,7 +334,6 @@ impl IntoResponse for HttpError {
         ParquetCompression,
         RawStringFormat,
         RawBytesFormat,
-        FlatbuffersFormat,
         TimestampFormat,
         DecimalEncoding,
         Framing,
