@@ -83,7 +83,7 @@ If a failure occurs mid-pipeline, the job restarts from the last fully committed
 
 ### At-Least-Once Option
 
-Individual state tables can opt out of two-phase commit (`uses_two_phase_phase_commit = false`) for at-least-once semantics with lower overhead. The default is exactly-once.
+Individual state tables can opt out of two-phase commit (`uses_two_phase_commit = false`) for at-least-once semantics with lower overhead. The default is exactly-once.
 
 ---
 
