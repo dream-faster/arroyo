@@ -306,7 +306,7 @@ impl WorkerJobController {
         }
 
         // have any of our tasks finished?
-        if !self.stopping && self.model.any_finished_sources() {
+        if !self.stopping && self.model.any_finished_bounded_sources() {
             return Ok(ControllerProgress::Finishing);
         }
 

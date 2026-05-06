@@ -230,7 +230,7 @@ impl JobController {
         }
 
         // have any of our tasks finished?
-        if self.model.any_finished_sources() {
+        if self.model.any_finished_bounded_sources() {
             return Ok(ControllerProgress::Finishing);
         }
 
@@ -427,5 +427,141 @@ impl JobController {
 
             Ok(new_min)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arroyo_datastream::logical::{LogicalGraph, LogicalNode, LogicalProgram, OperatorName};
+    use arroyo_rpc::checkpoints::{
+        CheckpointMetadataStore, CreateCheckpointReq, FinishCheckpointReq, UpdateCheckpointReq,
+    };
+    use arroyo_rpc::grpc::api::ConnectorOp;
+    use prost::Message;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct NoopCheckpointStore;
+
+    #[async_trait::async_trait]
+    impl CheckpointMetadataStore for NoopCheckpointStore {
+        async fn create_checkpoint(&self, _req: CreateCheckpointReq) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_checkpoint(&self, _req: UpdateCheckpointReq) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn finish_checkpoint(&self, _req: FinishCheckpointReq) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn mark_compacting(
+            &self,
+            _job_id: &str,
+            _min_epoch: u32,
+            _new_min: u32,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn mark_checkpoints_compacted(
+            &self,
+            _job_id: &str,
+            _epoch: u32,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn drop_old_checkpoint_rows(&self, _job_id: &str, _epoch: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn notify_checkpoint_complete(&self) {}
+    }
+
+    fn test_job_config() -> JobConfig {
+        JobConfig {
+            id: Arc::new("job-test".to_string()),
+            organization_id: "org".to_string(),
+            pipeline_name: "pipeline".to_string(),
+            pipeline_id: 1,
+            stop_mode: SqlStopMode::none,
+            checkpoint_interval: Duration::from_secs(60),
+            ttl: None,
+            parallelism_overrides: HashMap::new(),
+            restart_nonce: 0,
+            restart_mode: crate::types::public::RestartMode::safe,
+            ignore_state_before_epoch: None,
+        }
+    }
+
+    fn source_node(node_id: u32, connector: &str, parallelism: usize) -> LogicalNode {
+        LogicalNode::single(
+            node_id,
+            format!("operator_{node_id}"),
+            OperatorName::ConnectorSource,
+            ConnectorOp {
+                connector: connector.to_string(),
+                config: "{}".to_string(),
+                description: format!("{connector} source"),
+            }
+            .encode_to_vec(),
+            format!("{connector} source"),
+            parallelism,
+        )
+    }
+
+    fn controller_with_program(program: Arc<LogicalProgram>) -> JobController {
+        JobController::new(
+            Arc::new(NoopCheckpointStore),
+            test_job_config(),
+            program.clone(),
+            0,
+            0,
+            HashMap::new(),
+            None,
+            JobMetrics::new(program),
+        )
+    }
+
+    #[tokio::test]
+    async fn finishes_only_after_all_bounded_source_subtasks_finish() {
+        let mut graph = LogicalGraph::default();
+        graph.add_node(source_node(1, "filesystem", 2));
+
+        let program = Arc::new(LogicalProgram::new(graph, Default::default()));
+        let mut controller = controller_with_program(program);
+
+        controller.model.tasks.get_mut(&(1, 0)).unwrap().state = TaskState::Finished;
+        assert!(matches!(
+            controller.progress().await.unwrap(),
+            ControllerProgress::Continue
+        ));
+
+        controller.model.tasks.get_mut(&(1, 1)).unwrap().state = TaskState::Finished;
+        assert!(matches!(
+            controller.progress().await.unwrap(),
+            ControllerProgress::Finishing
+        ));
+    }
+
+    #[tokio::test]
+    async fn nats_source_completion_does_not_trigger_finishing() {
+        let mut graph = LogicalGraph::default();
+        graph.add_node(source_node(1, "nats", 1));
+
+        let program = Arc::new(LogicalProgram::new(graph, Default::default()));
+        let mut controller = controller_with_program(program);
+
+        controller.model.tasks.get_mut(&(1, 0)).unwrap().state = TaskState::Finished;
+
+        assert!(matches!(
+            controller.progress().await.unwrap(),
+            ControllerProgress::Continue
+        ));
+        assert_eq!(controller.model.finished_unbounded_sources().len(), 1);
     }
 }
