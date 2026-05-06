@@ -120,6 +120,12 @@
                                             "type": "integer",
                                             "description": "The maximum number of messages that can be delivered to the consumer before they are considered expired.",
                                             "default": 300000
+                                        },
+                                        "stopAfterCatchup": {
+                                            "title": "Stop after catchup",
+                                            "type": "boolean",
+                                            "description": "When enabled, stop the source gracefully after it has consumed at least one message, caught up to the end of the stream, and remained quiet for a short grace period.",
+                                            "default": false
                                         }
                                     },
                                     "required": [

@@ -14,7 +14,7 @@ use crate::{
     schema_from_df_fields,
 };
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use arroyo_rpc::TIMESTAMP_FIELD;
 use arroyo_rpc::UPDATING_META_FIELD;
 use datafusion::logical_expr::UserDefinedLogicalNode;
@@ -135,8 +135,11 @@ impl SourceRewriter<'_> {
                     DataFusionError::Plan(format!("Event time field {event_time_field} not found"))
                 })?;
 
-            let event_time_field =
-                event_time_field.alias_qualified(Some(qualifier.clone()), "_timestamp".to_string());
+            let event_time_field = Expr::Cast(datafusion::logical_expr::Cast {
+                expr: Box::new(event_time_field),
+                data_type: DataType::Timestamp(TimeUnit::Nanosecond, None),
+            })
+            .alias_qualified(Some(qualifier.clone()), "_timestamp".to_string());
             expressions.push(event_time_field);
         } else {
             expressions.push(Expr::Column(Column::new(
@@ -208,6 +211,7 @@ impl SourceRewriter<'_> {
             remote,
             table_scan.table_name.clone(),
             Self::watermark_expression(table)?,
+            table.idle_time,
         )
         .map_err(|err| {
             DataFusionError::Internal(format!("failed to create watermark expression: {err}"))

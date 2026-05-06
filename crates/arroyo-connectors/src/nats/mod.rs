@@ -124,6 +124,9 @@ impl NatsConnector {
                         max_expires: options
                             .pull_opt_i64("consumer.max_expires")?
                             .unwrap_or(300000),
+                        stop_after_catchup: options
+                            .pull_opt_bool("consumer.stop_after_catchup")?
+                            .unwrap_or(false),
                     }),
                     (None, Some(subject)) => Some(SourceType::Core { subject }),
                     (Some(_), Some(_)) => bail!("Exactly one of `stream` or `subject` must be set"),

@@ -13,6 +13,7 @@ use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
 use prost::Message;
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) const WATERMARK_NODE_NAME: &str = "WatermarkNode";
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -22,6 +23,7 @@ pub struct WatermarkNode {
     pub watermark_expression: Expr,
     pub schema: DFSchemaRef,
     timestamp_index: usize,
+    idle_time: Option<Duration>,
 }
 
 multifield_partial_ord!(
@@ -29,7 +31,8 @@ multifield_partial_ord!(
     input,
     qualifier,
     watermark_expression,
-    timestamp_index
+    timestamp_index,
+    idle_time
 );
 
 impl UserDefinedLogicalNodeCore for WatermarkNode {
@@ -72,6 +75,7 @@ impl UserDefinedLogicalNodeCore for WatermarkNode {
             watermark_expression: exprs.into_iter().next().unwrap(),
             schema: self.schema.clone(),
             timestamp_index,
+            idle_time: self.idle_time,
         })
     }
 }
@@ -95,7 +99,7 @@ impl ArroyoExtension for WatermarkNode {
             OperatorName::ExpressionWatermark,
             ExpressionWatermarkConfig {
                 period_micros: 1_000_000,
-                idle_time_micros: None,
+                idle_time_micros: self.idle_time.map(|d| d.as_micros() as u64),
                 expression: expression.encode_to_vec(),
                 input_schema: Some(self.arroyo_schema().into()),
             }
@@ -121,6 +125,7 @@ impl WatermarkNode {
         input: LogicalPlan,
         qualifier: TableReference,
         watermark_expression: Expr,
+        idle_time: Option<Duration>,
     ) -> Result<Self> {
         let schema = add_timestamp_field(input.schema().clone(), Some(qualifier.clone()))?;
         let timestamp_index = schema
@@ -132,6 +137,7 @@ impl WatermarkNode {
             watermark_expression,
             schema,
             timestamp_index,
+            idle_time,
         })
     }
     pub(crate) fn arroyo_schema(&self) -> ArroyoSchema {

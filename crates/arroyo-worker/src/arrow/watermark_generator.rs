@@ -157,10 +157,9 @@ impl ArrowOperator for WatermarkGenerator {
         self.last_event = SystemTime::now();
 
         let timestamp_column = get_timestamp_col(&record, ctx);
-        let Some(max_timestamp) = kernels::aggregate::max(timestamp_column) else {
+        let Some(_max_timestamp) = kernels::aggregate::max(timestamp_column) else {
             return Ok(());
         };
-        let max_timestamp = from_nanos(max_timestamp as u128);
 
         // calculate watermark using expression
         let watermark = self
@@ -173,11 +172,12 @@ impl ArrowOperator for WatermarkGenerator {
             .downcast_ref::<arrow::array::TimestampNanosecondArray>()
             .unwrap();
 
-        let watermark = from_nanos(kernels::aggregate::min(watermark).unwrap() as u128);
+        let watermark = from_nanos(kernels::aggregate::max(watermark).unwrap() as u128);
 
         self.state_cache.max_watermark = self.state_cache.max_watermark.max(watermark);
+        let watermark_to_emit = self.state_cache.max_watermark;
         if self.idle
-            || max_timestamp
+            || watermark_to_emit
                 .duration_since(self.state_cache.last_watermark_emitted_at)
                 .unwrap_or(Duration::ZERO)
                 > self.interval
@@ -185,12 +185,12 @@ impl ArrowOperator for WatermarkGenerator {
             debug!(
                 "[{}] Emitting expression watermark {}",
                 ctx.task_info.task_index,
-                to_millis(watermark)
+                to_millis(watermark_to_emit)
             );
             collector
-                .broadcast_watermark(Watermark::EventTime(watermark))
+                .broadcast_watermark(Watermark::EventTime(watermark_to_emit))
                 .await?;
-            self.state_cache.last_watermark_emitted_at = max_timestamp;
+            self.state_cache.last_watermark_emitted_at = watermark_to_emit;
             self.idle = false;
         }
         Ok(())

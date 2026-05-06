@@ -24,6 +24,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::SystemTime;
 use tokio::select;
+use tokio::time::{Instant, sleep_until};
 use tracing::debug;
 use tracing::info;
 
@@ -36,6 +37,10 @@ pub struct NatsSourceFunc {
     pub framing: Option<Framing>,
     pub bad_data: Option<BadData>,
     pub messages_per_second: NonZeroU32,
+}
+
+impl NatsSourceFunc {
+    const JETSTREAM_CATCHUP_GRACE_PERIOD: Duration = Duration::from_secs(5);
 }
 
 #[async_trait]
@@ -337,7 +342,11 @@ impl NatsSourceFunc {
             .expect("Failed instantiating NATS client");
 
         match self.source_type.clone() {
-            SourceType::Jetstream { stream, .. } => {
+            SourceType::Jetstream {
+                stream,
+                stop_after_catchup,
+                ..
+            } => {
                 let start_sequence = self
                     .get_start_sequence_number(ctx)
                     .await
@@ -353,14 +362,33 @@ impl NatsSourceFunc {
                     .expect("No stream of messages found for consumer");
 
                 let mut sequence_numbers: HashMap<String, NatsState> = HashMap::new();
+                let mut seen_messages = false;
+                let mut catchup_deadline: Option<Instant> = None;
 
                 loop {
                     select! {
+                        _ = async {
+                            match catchup_deadline {
+                                Some(deadline) => sleep_until(deadline).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        }, if stop_after_catchup => {
+                            if seen_messages {
+                                collector.flush_buffer().await?;
+                                return Ok(SourceFinishType::Final);
+                            }
+                        }
                         message = messages.next() => {
                             match message {
                                 Some(Ok(msg)) => {
                                     let payload = msg.payload.as_ref();
                                     let message_info = msg.info().expect("Couldn't get message information");
+                                    seen_messages = true;
+                                    catchup_deadline = if stop_after_catchup && message_info.pending == 0 {
+                                        Some(Instant::now() + Self::JETSTREAM_CATCHUP_GRACE_PERIOD)
+                                    } else {
+                                        None
+                                    };
                                     let timestamp = message_info.published.into() ;
                                     collector.deserialize_slice(payload, timestamp, None).await?;
 
