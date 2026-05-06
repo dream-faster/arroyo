@@ -8,14 +8,24 @@ on:
       - '*docker*'
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*' # Semver matching pattern with optional suffix
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build from
+        required: false
+        type: string
   workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: ${{ github.ref }}-docker
+  group: ${{ inputs.ref || github.ref }}-docker
   cancel-in-progress: false
 
 jobs:
@@ -36,12 +46,24 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Prepare
         id: prepare
         run: |
           platform=${{ matrix.platform }}
+          ref="${{ inputs.ref || github.ref }}"
+          ref_name="${ref#refs/heads/}"
+          ref_name="${ref_name#refs/tags/}"
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
           echo "image_namespace=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+          echo "ref=${ref}" >> $GITHUB_OUTPUT
+          echo "ref_name=${ref_name}" >> $GITHUB_OUTPUT
+          if [[ "${ref}" == refs/heads/* ]]; then
+            echo "use_raw_ref_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "use_raw_ref_tag=false" >> $GITHUB_OUTPUT
+          fi
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -100,7 +122,17 @@ jobs:
       - name: Prepare
         id: prepare
         run: |
+          ref="${{ inputs.ref || github.ref }}"
+          ref_name="${ref#refs/heads/}"
+          ref_name="${ref_name#refs/tags/}"
           echo "image_namespace=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+          echo "ref=${ref}" >> $GITHUB_OUTPUT
+          echo "ref_name=${ref_name}" >> $GITHUB_OUTPUT
+          if [[ "${ref}" == refs/heads/* ]]; then
+            echo "use_raw_ref_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "use_raw_ref_tag=false" >> $GITHUB_OUTPUT
+          fi
       -
         name: Download digests
         uses: actions/download-artifact@v4
@@ -125,6 +157,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha
+            type=raw,value=${{ steps.prepare.outputs.ref_name }},enable=${{ steps.prepare.outputs.use_raw_ref_tag == 'true' }}
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
