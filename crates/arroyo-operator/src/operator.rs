@@ -722,7 +722,11 @@ impl ChainedOperator {
             SignalMessage::EndOfData => {
                 closed.insert(idx);
                 if closed.len() == in_partitions {
-                    return Ok(ControlOutcome::Finish);
+                    return if self.operator.is_committing() {
+                        Ok(ControlOutcome::StopAfterCommit)
+                    } else {
+                        Ok(ControlOutcome::Finish)
+                    };
                 }
             }
         }
