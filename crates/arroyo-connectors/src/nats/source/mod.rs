@@ -417,8 +417,7 @@ impl NatsSourceFunc {
                                     return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
                                 },
                                 None => {
-                                    break
-                                    info!("Finished reading message from {}", stream.clone());
+                                    return Err(connector_err!(External, WithBackoff, "NATS JetStream consumer closed unexpectedly"));
                                 },
                             }
                         }
@@ -462,7 +461,7 @@ impl NatsSourceFunc {
                         }
                     }
                 }
-                Ok(SourceFinishType::Graceful)
+                unreachable!("JetStream loop only exits via control messages")
             }
             SourceType::Core { subject, .. } => {
                 let mut messages = nats_client
