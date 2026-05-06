@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use tokio::select;
 use tracing::debug;
 use tracing::info;
+use tracing::warn;
 
 pub struct NatsSourceFunc {
     pub source_type: SourceType,
@@ -45,6 +46,19 @@ fn unexpected_stream_end<T>(source_name: &str) -> DataflowResult<T> {
         "NATS source stream ended unexpectedly for {}",
         source_name
     ))
+}
+
+fn should_error_on_none(seen_none: &mut bool, source_name: &str) -> bool {
+    if *seen_none {
+        return true;
+    }
+
+    *seen_none = true;
+    warn!(
+        message = "Ignoring transient empty read from NATS source stream",
+        source = source_name
+    );
+    false
 }
 
 #[async_trait]
@@ -362,12 +376,14 @@ impl NatsSourceFunc {
                     .expect("No stream of messages found for consumer");
 
                 let mut sequence_numbers: HashMap<String, NatsState> = HashMap::new();
+                let mut seen_none = false;
 
                 loop {
                     select! {
                         message = messages.next() => {
                             match message {
                                 Some(Ok(msg)) => {
+                                    seen_none = false;
                                     let payload = msg.payload.as_ref();
                                     let message_info = msg.info().expect("Couldn't get message information");
                                     let timestamp = message_info.published.into() ;
@@ -426,7 +442,9 @@ impl NatsSourceFunc {
                                     return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
                                 },
                                 None => {
-                                    return unexpected_stream_end(&stream);
+                                    if should_error_on_none(&mut seen_none, &stream) {
+                                        return unexpected_stream_end(&stream);
+                                    }
                                 },
                             }
                         }
@@ -476,11 +494,13 @@ impl NatsSourceFunc {
                     .subscribe(subject.clone())
                     .await
                     .expect("Failed subscribing to NATS subject");
+                let mut seen_none = false;
                 loop {
                     select! {
                         message = messages.next() => {
                             match message {
                                 Some(msg) => {
+                                    seen_none = false;
                                     let payload = msg.payload.as_ref();
                                     let timestamp = SystemTime::now();
                                     collector.deserialize_slice(payload, timestamp, None).await?;
@@ -489,7 +509,9 @@ impl NatsSourceFunc {
                                     }
                                 },
                                 None => {
-                                    return unexpected_stream_end(&subject);
+                                    if should_error_on_none(&mut seen_none, &subject) {
+                                        return unexpected_stream_end(&subject);
+                                    }
                                 },
                             }
                         }
@@ -544,5 +566,18 @@ mod tests {
                 .contains("NATS source stream ended unexpectedly")
         );
         assert!(err.to_string().contains("orders"));
+    }
+
+    #[test]
+    fn first_none_is_ignored() {
+        let mut seen_none = false;
+        assert!(!should_error_on_none(&mut seen_none, "orders"));
+        assert!(seen_none);
+    }
+
+    #[test]
+    fn second_consecutive_none_errors() {
+        let mut seen_none = true;
+        assert!(should_error_on_none(&mut seen_none, "orders"));
     }
 }
