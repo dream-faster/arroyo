@@ -38,6 +38,15 @@ pub struct NatsSourceFunc {
     pub messages_per_second: NonZeroU32,
 }
 
+fn unexpected_stream_end<T>(source_name: &str) -> DataflowResult<T> {
+    Err(connector_err!(
+        External,
+        WithBackoff,
+        "NATS source stream ended unexpectedly for {}",
+        source_name
+    ))
+}
+
 #[async_trait]
 impl SourceOperator for NatsSourceFunc {
     fn name(&self) -> String {
@@ -417,8 +426,7 @@ impl NatsSourceFunc {
                                     return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
                                 },
                                 None => {
-                                    break
-                                    info!("Finished reading message from {}", stream.clone());
+                                    return unexpected_stream_end(&stream);
                                 },
                             }
                         }
@@ -462,7 +470,6 @@ impl NatsSourceFunc {
                         }
                     }
                 }
-                Ok(SourceFinishType::Graceful)
             }
             SourceType::Core { subject, .. } => {
                 let mut messages = nats_client
@@ -482,8 +489,7 @@ impl NatsSourceFunc {
                                     }
                                 },
                                 None => {
-                                    break
-                                    info!("Finished reading message from {}", subject.clone());
+                                    return unexpected_stream_end(&subject);
                                 },
                             }
                         }
@@ -519,8 +525,24 @@ impl NatsSourceFunc {
                         }
                     }
                 }
-                Ok(SourceFinishType::Graceful)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_stream_end_returns_an_error() {
+        let err = unexpected_stream_end::<SourceFinishType>("orders")
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("NATS source stream ended unexpectedly")
+        );
+        assert!(err.to_string().contains("orders"));
     }
 }

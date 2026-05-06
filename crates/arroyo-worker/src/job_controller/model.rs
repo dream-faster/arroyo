@@ -1,13 +1,14 @@
 use crate::job_controller::checkpoint_state::CheckpointState;
 use crate::job_controller::{CHECKPOINTS_TO_KEEP, COMPACT_EVERY, RunningMessage, TaskFailedEvent};
 use anyhow::bail;
-use arroyo_datastream::logical::LogicalProgram;
+use arroyo_datastream::logical::{LogicalNode, LogicalProgram};
 use arroyo_rpc::api_types::checkpoints::{JobCheckpointEventType, JobCheckpointSpan};
 use arroyo_rpc::checkpoints::{
     CheckpointMetadataStore, CheckpointStatus, CreateCheckpointReq, FinishCheckpointReq,
     UpdateCheckpointReq,
 };
 use arroyo_rpc::config::config;
+use arroyo_rpc::grpc::api::ConnectorOp;
 use arroyo_rpc::grpc::rpc::worker_grpc_client::WorkerGrpcClient;
 use arroyo_rpc::grpc::rpc::{
     CheckpointReq, CommitReq, JobFinishedReq, LoadCompactedDataReq, TaskCheckpointEventType,
@@ -18,6 +19,7 @@ use arroyo_state::parquet::ParquetBackend;
 use arroyo_state::{BackingStore, StateBackend};
 use arroyo_types::{WorkerId, to_micros};
 use futures::future::try_join_all;
+use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -25,6 +27,15 @@ use tokio::task::JoinHandle;
 use tonic::Request;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
+
+const UNBOUNDED_SOURCE_CONNECTORS: [&str; 1] = ["nats"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedSource {
+    pub node_id: u32,
+    pub description: String,
+    pub connector: Option<String>,
+}
 
 pub struct RunningJobModel {
     pub job_id: Arc<String>,
@@ -217,6 +228,18 @@ impl RunningJobModel {
                         job_id = *self.job_id,
                         task_id = key.0,
                         subtask_idx
+                    );
+                }
+
+                if let Some(source) = self.unbounded_source_for_task(task_id) {
+                    error!(
+                        message = "Unbounded source task finished unexpectedly",
+                        job_id = *self.job_id,
+                        task_id,
+                        subtask_idx,
+                        node_id = source.node_id,
+                        description = source.description,
+                        connector = source.connector.as_deref().unwrap_or("unknown"),
                     );
                 }
             }
@@ -513,12 +536,59 @@ impl RunningJobModel {
         None
     }
 
-    pub fn any_finished_sources(&self) -> bool {
-        let source_tasks = self.program.sources();
+    fn source_connector(node: &LogicalNode) -> Option<String> {
+        ConnectorOp::decode(&node.operator_chain.first().operator_config[..])
+            .ok()
+            .map(|connector| connector.connector)
+    }
 
-        self.tasks.iter().any(|((operator, _), t)| {
-            source_tasks.contains(operator) && t.state == TaskState::Finished
+    fn is_unbounded_source(node: &LogicalNode) -> bool {
+        Self::source_connector(node)
+            .as_deref()
+            .is_some_and(|connector| UNBOUNDED_SOURCE_CONNECTORS.contains(&connector))
+    }
+
+    fn source_finished(&self, node: &LogicalNode) -> bool {
+        (0..node.parallelism as u32).all(|subtask_idx| {
+            self.tasks
+                .get(&(node.node_id, subtask_idx))
+                .is_some_and(|status| status.state == TaskState::Finished)
         })
+    }
+
+    pub fn any_finished_bounded_sources(&self) -> bool {
+        self.program
+            .graph
+            .node_weights()
+            .filter(|node| node.operator_chain.is_source())
+            .any(|node| self.source_finished(node) && !Self::is_unbounded_source(node))
+    }
+
+    pub fn finished_unbounded_sources(&self) -> Vec<FinishedSource> {
+        self.program
+            .graph
+            .node_weights()
+            .filter(|node| node.operator_chain.is_source())
+            .filter(|node| self.source_finished(node) && Self::is_unbounded_source(node))
+            .map(|node| FinishedSource {
+                node_id: node.node_id,
+                description: node.description.clone(),
+                connector: Self::source_connector(node),
+            })
+            .collect()
+    }
+
+    fn unbounded_source_for_task(&self, task_id: u32) -> Option<FinishedSource> {
+        self.program
+            .graph
+            .node_weights()
+            .find(|node| node.node_id == task_id && node.operator_chain.is_source())
+            .filter(|node| Self::is_unbounded_source(node))
+            .map(|node| FinishedSource {
+                node_id: node.node_id,
+                description: node.description.clone(),
+                connector: Self::source_connector(node),
+            })
     }
 
     pub fn all_tasks_finished(&self) -> bool {
