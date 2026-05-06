@@ -53,7 +53,7 @@ impl KubernetesScheduler {
         }
 
         let prefix = format!("{}-", self.config.worker.name());
-        let suffix = format!("-{}-{}", req.run_id, number);
+        let suffix = format!("-{}-{}", req.generation, number);
         let max_job_name_len = 253usize.saturating_sub(prefix.len() + suffix.len());
         let trimmed_job_name = &job_name[..min(job_name.len(), max_job_name_len)];
         format!("{prefix}{trimmed_job_name}{suffix}")
