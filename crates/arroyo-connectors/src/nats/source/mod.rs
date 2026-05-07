@@ -17,6 +17,7 @@ use arroyo_rpc::formats::{Format, Framing};
 use arroyo_rpc::grpc::rpc::StopMode;
 use arroyo_rpc::grpc::rpc::TableConfig;
 use async_nats::jetstream::consumer;
+use async_nats::jetstream::consumer::pull::MessagesErrorKind;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -24,9 +25,13 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::SystemTime;
 use tokio::select;
+use tokio::time::sleep;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub struct NatsSourceFunc {
     pub source_type: SourceType,
@@ -44,6 +49,17 @@ fn ignore_none_message(source_name: &str) {
         message = "Ignoring empty read from unbounded NATS source stream",
         source = source_name
     );
+}
+
+fn should_retry_messages_error(kind: MessagesErrorKind) -> bool {
+    matches!(
+        kind,
+        MessagesErrorKind::MissingHeartbeat | MessagesErrorKind::Pull | MessagesErrorKind::Other
+    )
+}
+
+fn next_retry_delay(current: Duration) -> Duration {
+    std::cmp::min(current.saturating_mul(2), MAX_RETRY_DELAY)
 }
 
 #[async_trait]
@@ -361,12 +377,14 @@ impl NatsSourceFunc {
                     .expect("No stream of messages found for consumer");
 
                 let mut sequence_numbers: HashMap<String, NatsState> = HashMap::new();
+                let mut retry_delay = INITIAL_RETRY_DELAY;
 
                 loop {
                     select! {
                         message = messages.next() => {
                             match message {
                                 Some(Ok(msg)) => {
+                                    retry_delay = INITIAL_RETRY_DELAY;
                                     let payload = msg.payload.as_ref();
                                     let message_info = msg.info().expect("Couldn't get message information");
                                     let timestamp = message_info.published.into() ;
@@ -421,12 +439,23 @@ impl NatsSourceFunc {
                                         .await
                                         .map_err(|e| connector_err!(External, WithBackoff, "failed to ack NATS message: {}", e))?;
                                 },
-                                Some(Err(msg)) => {
-                                    return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
+                                Some(Err(err)) => {
+                                    if should_retry_messages_error(err.kind()) {
+                                        warn!(
+                                            message = "Retrying transient JetStream pull error",
+                                            source = stream,
+                                            error = %err,
+                                            retry_delay_ms = retry_delay.as_millis()
+                                        );
+                                        sleep(retry_delay).await;
+                                        retry_delay = next_retry_delay(retry_delay);
+                                        continue;
+                                    }
+                                    return Err(connector_err!(External, WithBackoff, "NATS message error: {}", err));
                                 },
                                 None => {
                                     ignore_none_message(&stream);
-                                },
+                                }
                             }
                         }
                         control_message = ctx.control_rx.recv() => {
@@ -489,7 +518,7 @@ impl NatsSourceFunc {
                                 },
                                 None => {
                                     ignore_none_message(&subject);
-                                },
+                                }
                             }
                         }
                         control_message = ctx.control_rx.recv() => {
@@ -532,6 +561,35 @@ impl NatsSourceFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_nats::jetstream::consumer::pull::MessagesErrorKind;
+
+    #[test]
+    fn retries_transient_pull_errors() {
+        assert!(should_retry_messages_error(MessagesErrorKind::Other));
+        assert!(should_retry_messages_error(MessagesErrorKind::Pull));
+        assert!(should_retry_messages_error(
+            MessagesErrorKind::MissingHeartbeat
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_terminal_pull_errors() {
+        assert!(!should_retry_messages_error(
+            MessagesErrorKind::ConsumerDeleted
+        ));
+        assert!(!should_retry_messages_error(
+            MessagesErrorKind::PushBasedConsumer
+        ));
+    }
+
+    #[test]
+    fn retry_delay_caps_at_maximum() {
+        assert_eq!(
+            next_retry_delay(INITIAL_RETRY_DELAY),
+            Duration::from_millis(500)
+        );
+        assert_eq!(next_retry_delay(MAX_RETRY_DELAY), MAX_RETRY_DELAY);
+    }
 
     #[test]
     fn none_messages_from_unbounded_sources_are_ignored() {
