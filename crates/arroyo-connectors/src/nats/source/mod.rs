@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use tokio::select;
 use tracing::debug;
 use tracing::info;
+use tracing::warn;
 
 pub struct NatsSourceFunc {
     pub source_type: SourceType,
@@ -38,13 +39,11 @@ pub struct NatsSourceFunc {
     pub messages_per_second: NonZeroU32,
 }
 
-fn unexpected_stream_end<T>(source_name: &str) -> DataflowResult<T> {
-    Err(connector_err!(
-        External,
-        WithBackoff,
-        "NATS source stream ended unexpectedly for {}",
-        source_name
-    ))
+fn ignore_none_message(source_name: &str) {
+    warn!(
+        message = "Ignoring empty read from unbounded NATS source stream",
+        source = source_name
+    );
 }
 
 #[async_trait]
@@ -426,7 +425,7 @@ impl NatsSourceFunc {
                                     return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
                                 },
                                 None => {
-                                    return unexpected_stream_end(&stream);
+                                    ignore_none_message(&stream);
                                 },
                             }
                         }
@@ -489,7 +488,7 @@ impl NatsSourceFunc {
                                     }
                                 },
                                 None => {
-                                    return unexpected_stream_end(&subject);
+                                    ignore_none_message(&subject);
                                 },
                             }
                         }
@@ -535,14 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unexpected_stream_end_returns_an_error() {
-        let err = unexpected_stream_end::<SourceFinishType>("orders")
-            .err()
-            .unwrap();
-        assert!(
-            err.to_string()
-                .contains("NATS source stream ended unexpectedly")
-        );
-        assert!(err.to_string().contains("orders"));
+    fn none_messages_from_unbounded_sources_are_ignored() {
+        ignore_none_message("orders");
     }
 }
