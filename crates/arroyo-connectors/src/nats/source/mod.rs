@@ -39,26 +39,11 @@ pub struct NatsSourceFunc {
     pub messages_per_second: NonZeroU32,
 }
 
-fn unexpected_stream_end<T>(source_name: &str) -> DataflowResult<T> {
-    Err(connector_err!(
-        External,
-        WithBackoff,
-        "NATS source stream ended unexpectedly for {}",
-        source_name
-    ))
-}
-
-fn should_error_on_none(seen_none: &mut bool, source_name: &str) -> bool {
-    if *seen_none {
-        return true;
-    }
-
-    *seen_none = true;
+fn ignore_none_message(source_name: &str) {
     warn!(
-        message = "Ignoring transient empty read from NATS source stream",
+        message = "Ignoring empty read from unbounded NATS source stream",
         source = source_name
     );
-    false
 }
 
 #[async_trait]
@@ -376,14 +361,12 @@ impl NatsSourceFunc {
                     .expect("No stream of messages found for consumer");
 
                 let mut sequence_numbers: HashMap<String, NatsState> = HashMap::new();
-                let mut seen_none = false;
 
                 loop {
                     select! {
                         message = messages.next() => {
                             match message {
                                 Some(Ok(msg)) => {
-                                    seen_none = false;
                                     let payload = msg.payload.as_ref();
                                     let message_info = msg.info().expect("Couldn't get message information");
                                     let timestamp = message_info.published.into() ;
@@ -442,9 +425,7 @@ impl NatsSourceFunc {
                                     return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
                                 },
                                 None => {
-                                    if should_error_on_none(&mut seen_none, &stream) {
-                                        return unexpected_stream_end(&stream);
-                                    }
+                                    ignore_none_message(&stream);
                                 },
                             }
                         }
@@ -494,13 +475,11 @@ impl NatsSourceFunc {
                     .subscribe(subject.clone())
                     .await
                     .expect("Failed subscribing to NATS subject");
-                let mut seen_none = false;
                 loop {
                     select! {
                         message = messages.next() => {
                             match message {
                                 Some(msg) => {
-                                    seen_none = false;
                                     let payload = msg.payload.as_ref();
                                     let timestamp = SystemTime::now();
                                     collector.deserialize_slice(payload, timestamp, None).await?;
@@ -509,9 +488,7 @@ impl NatsSourceFunc {
                                     }
                                 },
                                 None => {
-                                    if should_error_on_none(&mut seen_none, &subject) {
-                                        return unexpected_stream_end(&subject);
-                                    }
+                                    ignore_none_message(&subject);
                                 },
                             }
                         }
@@ -557,27 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unexpected_stream_end_returns_an_error() {
-        let err = unexpected_stream_end::<SourceFinishType>("orders")
-            .err()
-            .unwrap();
-        assert!(
-            err.to_string()
-                .contains("NATS source stream ended unexpectedly")
-        );
-        assert!(err.to_string().contains("orders"));
-    }
-
-    #[test]
-    fn first_none_is_ignored() {
-        let mut seen_none = false;
-        assert!(!should_error_on_none(&mut seen_none, "orders"));
-        assert!(seen_none);
-    }
-
-    #[test]
-    fn second_consecutive_none_errors() {
-        let mut seen_none = true;
-        assert!(should_error_on_none(&mut seen_none, "orders"));
+    fn none_messages_from_unbounded_sources_are_ignored() {
+        ignore_none_message("orders");
     }
 }
