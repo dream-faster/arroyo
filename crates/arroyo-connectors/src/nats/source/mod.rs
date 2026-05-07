@@ -17,6 +17,7 @@ use arroyo_rpc::formats::{Format, Framing};
 use arroyo_rpc::grpc::rpc::StopMode;
 use arroyo_rpc::grpc::rpc::TableConfig;
 use async_nats::jetstream::consumer;
+use async_nats::jetstream::consumer::pull::MessagesErrorKind;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -24,9 +25,13 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 use std::time::SystemTime;
 use tokio::select;
+use tokio::time::sleep;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub struct NatsSourceFunc {
     pub source_type: SourceType,
@@ -39,11 +44,34 @@ pub struct NatsSourceFunc {
     pub messages_per_second: NonZeroU32,
 }
 
-fn ignore_none_message(source_name: &str) {
+fn retry_delay_after_stream_end(source_name: &str, retry_delay: Duration) {
     warn!(
-        message = "Ignoring empty read from unbounded NATS source stream",
-        source = source_name
+        message = "Recreating unbounded NATS source stream after iterator ended",
+        source = source_name,
+        retry_delay_ms = retry_delay.as_millis()
     );
+}
+
+fn should_retry_messages_error(kind: MessagesErrorKind) -> bool {
+    matches!(
+        kind,
+        MessagesErrorKind::MissingHeartbeat | MessagesErrorKind::Pull | MessagesErrorKind::Other
+    )
+}
+
+fn next_retry_delay(current: Duration) -> Duration {
+    std::cmp::min(current.saturating_mul(2), MAX_RETRY_DELAY)
+}
+
+fn current_stream_sequence(
+    sequence_numbers: &HashMap<String, NatsState>,
+    operator_id: &str,
+    default_sequence: u64,
+) -> u64 {
+    sequence_numbers
+        .get(operator_id)
+        .map(|state| state.stream_sequence_number.saturating_add(1))
+        .unwrap_or(default_sequence)
 }
 
 #[async_trait]
@@ -346,180 +374,215 @@ impl NatsSourceFunc {
 
         match self.source_type.clone() {
             SourceType::Jetstream { stream, .. } => {
-                let start_sequence = self
+                let initial_start_sequence = self
                     .get_start_sequence_number(ctx)
                     .await
                     .expect("Failed to get start sequence number");
                 let nats_stream = &self
                     .get_nats_stream(nats_client.clone(), stream.clone())
                     .await;
-                let mut messages = self
-                    .create_nats_consumer(nats_stream, start_sequence, ctx)
-                    .await
-                    .messages()
-                    .await
-                    .expect("No stream of messages found for consumer");
 
                 let mut sequence_numbers: HashMap<String, NatsState> = HashMap::new();
+                let mut retry_delay = INITIAL_RETRY_DELAY;
 
                 loop {
-                    select! {
-                        message = messages.next() => {
-                            match message {
-                                Some(Ok(msg)) => {
-                                    let payload = msg.payload.as_ref();
-                                    let message_info = msg.info().expect("Couldn't get message information");
-                                    let timestamp = message_info.published.into() ;
-                                    collector.deserialize_slice(payload, timestamp, None).await?;
+                    let start_sequence = current_stream_sequence(
+                        &sequence_numbers,
+                        &ctx.task_info.operator_id,
+                        initial_start_sequence,
+                    );
+                    let mut messages = self
+                        .create_nats_consumer(nats_stream, start_sequence, ctx)
+                        .await
+                        .messages()
+                        .await
+                        .expect("No stream of messages found for consumer");
 
-                                    debug!("---------------------------------------------->");
-                                    debug!(
-                                        "Delivered stream sequence: {}",
-                                        message_info.stream_sequence
-                                    );
-                                    debug!(
-                                        "Delivered consumer sequence: {}",
-                                        message_info.consumer_sequence
-                                    );
-                                    debug!(
-                                        "Delivered message stream: {}",
-                                        message_info.stream
-                                    );
-                                    debug!(
-                                        "Delivered message consumer: {}",
-                                        message_info.consumer
-                                    );
-                                    debug!(
-                                        "Delivered message published: {}",
-                                        message_info.published
-                                    );
-                                    debug!(
-                                        "Delivered message pending: {}",
-                                        message_info.pending
-                                    );
-                                    debug!(
-                                        "Delivered message delivered: {}",
-                                        message_info.delivered
-                                    );
+                    let mut recreate_consumer = false;
+                    while !recreate_consumer {
+                        select! {
+                            message = messages.next() => {
+                                match message {
+                                    Some(Ok(msg)) => {
+                                        retry_delay = INITIAL_RETRY_DELAY;
+                                        let payload = msg.payload.as_ref();
+                                        let message_info = msg.info().expect("Couldn't get message information");
+                                        let timestamp = message_info.published.into() ;
+                                        collector.deserialize_slice(payload, timestamp, None).await?;
 
-                                    if collector.should_flush() {
-                                        collector.flush_buffer().await?;
-                                    }
+                                        debug!("---------------------------------------------->");
+                                        debug!(
+                                            "Delivered stream sequence: {}",
+                                            message_info.stream_sequence
+                                        );
+                                        debug!(
+                                            "Delivered consumer sequence: {}",
+                                            message_info.consumer_sequence
+                                        );
+                                        debug!(
+                                            "Delivered message stream: {}",
+                                            message_info.stream
+                                        );
+                                        debug!(
+                                            "Delivered message consumer: {}",
+                                            message_info.consumer
+                                        );
+                                        debug!(
+                                            "Delivered message published: {}",
+                                            message_info.published
+                                        );
+                                        debug!(
+                                            "Delivered message pending: {}",
+                                            message_info.pending
+                                        );
+                                        debug!(
+                                            "Delivered message delivered: {}",
+                                            message_info.delivered
+                                        );
 
-                                    sequence_numbers.insert(
-                                        ctx.task_info.operator_id.clone(),
-                                        NatsState {
-                                            stream_name: stream.clone(),
-                                            stream_sequence_number: message_info.stream_sequence
+                                        if collector.should_flush() {
+                                            collector.flush_buffer().await?;
                                         }
-                                    );
 
-                                    // TODO: Has ACK to happens here at every message? Maybe it can be
-                                    // done by ack only the last message before checkpointing in the below
-                                    // `ControlMessage::Checkpoint` match.
-                                    msg.ack()
-                                        .await
-                                        .map_err(|e| connector_err!(External, WithBackoff, "failed to ack NATS message: {}", e))?;
-                                },
-                                Some(Err(msg)) => {
-                                    return Err(connector_err!(External, WithBackoff, "NATS message error: {}", msg));
-                                },
-                                None => {
-                                    ignore_none_message(&stream);
-                                },
-                            }
-                        }
-                        control_message = ctx.control_rx.recv() => {
-                            match control_message {
-                                Some(ControlMessage::Checkpoint(c)) => {
-                                    debug!("Starting checkpointing {}", ctx.task_info.task_index);
-                                    let state = ctx.table_manager
-                                        .get_global_keyed_state("n")
-                                        .await?;
+                                        sequence_numbers.insert(
+                                            ctx.task_info.operator_id.clone(),
+                                            NatsState {
+                                                stream_name: stream.clone(),
+                                                stream_sequence_number: message_info.stream_sequence
+                                            }
+                                        );
 
-                                    // TODO: Should this be parallelized?
-                                    for (stream_name, sequence_number) in &sequence_numbers {
-                                        state.insert(stream_name.clone(), sequence_number.clone()).await;
-                                    }
-
-                                    if self.start_checkpoint(c, ctx, collector).await {
-                                        return Ok(SourceFinishType::Immediate);
-                                    }
+                                        msg.ack()
+                                            .await
+                                            .map_err(|e| connector_err!(External, WithBackoff, "failed to ack NATS message: {}", e))?;
+                                    },
+                                    Some(Err(err)) => {
+                                        let kind = err.kind();
+                                        if should_retry_messages_error(kind) {
+                                            warn!(
+                                                message = "Retrying transient JetStream pull error",
+                                                source = stream,
+                                                error = %err,
+                                                retry_delay_ms = retry_delay.as_millis()
+                                            );
+                                            sleep(retry_delay).await;
+                                            retry_delay = next_retry_delay(retry_delay);
+                                            continue;
+                                        }
+                                        return Err(connector_err!(
+                                            External,
+                                            WithBackoff,
+                                            "fatal NATS message error for {}: {}",
+                                            stream,
+                                            err
+                                        ));
+                                    },
+                                    None => {
+                                        retry_delay_after_stream_end(&stream, retry_delay);
+                                        sleep(retry_delay).await;
+                                        retry_delay = next_retry_delay(retry_delay);
+                                        recreate_consumer = true;
+                                    },
                                 }
-                                Some(ControlMessage::Stop { mode }) => {
-                                    info!("Stopping NATS source: {:?}", mode);
-                                    match mode {
-                                        StopMode::Graceful => {
-                                            return Ok(SourceFinishType::Graceful);
+                            }
+                            control_message = ctx.control_rx.recv() => {
+                                match control_message {
+                                    Some(ControlMessage::Checkpoint(c)) => {
+                                        debug!("Starting checkpointing {}", ctx.task_info.task_index);
+                                        let state = ctx.table_manager
+                                            .get_global_keyed_state("n")
+                                            .await?;
+
+                                        for (stream_name, sequence_number) in &sequence_numbers {
+                                            state.insert(stream_name.clone(), sequence_number.clone()).await;
                                         }
-                                        StopMode::Immediate => {
+
+                                        if self.start_checkpoint(c, ctx, collector).await {
                                             return Ok(SourceFinishType::Immediate);
                                         }
                                     }
+                                    Some(ControlMessage::Stop { mode }) => {
+                                        info!("Stopping NATS source: {:?}", mode);
+                                        match mode {
+                                            StopMode::Graceful => {
+                                                return Ok(SourceFinishType::Graceful);
+                                            }
+                                            StopMode::Immediate => {
+                                                return Ok(SourceFinishType::Immediate);
+                                            }
+                                        }
+                                    }
+                                    Some(ControlMessage::Commit { .. }) => {
+                                        unreachable!("Sources shouldn't receive commit messages");
+                                    }
+                                    Some(ControlMessage::LoadCompacted {compacted}) => {
+                                        ctx.load_compacted(compacted).await;
+                                    }
+                                    Some(ControlMessage::NoOp) => {}
+                                    None => {}
                                 }
-                                Some(ControlMessage::Commit { .. }) => {
-                                    unreachable!("Sources shouldn't receive commit messages");
-                                }
-                                Some(ControlMessage::LoadCompacted {compacted}) => {
-                                    ctx.load_compacted(compacted).await;
-                                }
-                                Some(ControlMessage::NoOp) => {}
-                                None => {}
                             }
                         }
                     }
                 }
             }
             SourceType::Core { subject, .. } => {
-                let mut messages = nats_client
-                    .subscribe(subject.clone())
-                    .await
-                    .expect("Failed subscribing to NATS subject");
+                let mut retry_delay = INITIAL_RETRY_DELAY;
                 loop {
-                    select! {
-                        message = messages.next() => {
-                            match message {
-                                Some(msg) => {
-                                    let payload = msg.payload.as_ref();
-                                    let timestamp = SystemTime::now();
-                                    collector.deserialize_slice(payload, timestamp, None).await?;
-                                    if collector.should_flush() {
-                                        collector.flush_buffer().await?;
-                                    }
-                                },
-                                None => {
-                                    ignore_none_message(&subject);
-                                },
-                            }
-                        }
-                        control_message = ctx.control_rx.recv() => {
-                            match control_message {
-                                Some(ControlMessage::Checkpoint(c)) => {
-                                    // TODO: Is checkpointing necessary for subjects?
-                                    debug!("Starting checkpointing {}", ctx.task_info.task_index);
-                                    if self.start_checkpoint(c, ctx, collector).await {
-                                        return Ok(SourceFinishType::Immediate);
-                                    }
-                                }
-                                Some(ControlMessage::Stop { mode }) => {
-                                    info!("Stopping NATS source: {:?}", mode);
-                                    match mode {
-                                        StopMode::Graceful => {
-                                            return Ok(SourceFinishType::Graceful);
+                    let mut messages = nats_client
+                        .subscribe(subject.clone())
+                        .await
+                        .expect("Failed subscribing to NATS subject");
+                    let mut recreate_subscription = false;
+                    while !recreate_subscription {
+                        select! {
+                            message = messages.next() => {
+                                match message {
+                                    Some(msg) => {
+                                        retry_delay = INITIAL_RETRY_DELAY;
+                                        let payload = msg.payload.as_ref();
+                                        let timestamp = SystemTime::now();
+                                        collector.deserialize_slice(payload, timestamp, None).await?;
+                                        if collector.should_flush() {
+                                            collector.flush_buffer().await?;
                                         }
-                                        StopMode::Immediate => {
+                                    },
+                                    None => {
+                                        retry_delay_after_stream_end(&subject, retry_delay);
+                                        sleep(retry_delay).await;
+                                        retry_delay = next_retry_delay(retry_delay);
+                                        recreate_subscription = true;
+                                    },
+                                }
+                            }
+                            control_message = ctx.control_rx.recv() => {
+                                match control_message {
+                                    Some(ControlMessage::Checkpoint(c)) => {
+                                        debug!("Starting checkpointing {}", ctx.task_info.task_index);
+                                        if self.start_checkpoint(c, ctx, collector).await {
                                             return Ok(SourceFinishType::Immediate);
                                         }
                                     }
+                                    Some(ControlMessage::Stop { mode }) => {
+                                        info!("Stopping NATS source: {:?}", mode);
+                                        match mode {
+                                            StopMode::Graceful => {
+                                                return Ok(SourceFinishType::Graceful);
+                                            }
+                                            StopMode::Immediate => {
+                                                return Ok(SourceFinishType::Immediate);
+                                            }
+                                        }
+                                    }
+                                    Some(ControlMessage::Commit { .. }) => {
+                                        unreachable!("Sources shouldn't receive commit messages");
+                                    }
+                                    Some(ControlMessage::LoadCompacted {compacted}) => {
+                                        ctx.load_compacted(compacted).await;
+                                    }
+                                    Some(ControlMessage::NoOp) => {}
+                                    None => {}
                                 }
-                                Some(ControlMessage::Commit { .. }) => {
-                                    unreachable!("Sources shouldn't receive commit messages");
-                                }
-                                Some(ControlMessage::LoadCompacted {compacted}) => {
-                                    ctx.load_compacted(compacted).await;
-                                }
-                                Some(ControlMessage::NoOp) => {}
-                                None => {}
                             }
                         }
                     }
@@ -532,9 +595,59 @@ impl NatsSourceFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_nats::jetstream::consumer::pull::MessagesErrorKind;
 
     #[test]
-    fn none_messages_from_unbounded_sources_are_ignored() {
-        ignore_none_message("orders");
+    fn retries_transient_pull_errors() {
+        assert!(should_retry_messages_error(MessagesErrorKind::Other));
+        assert!(should_retry_messages_error(MessagesErrorKind::Pull));
+        assert!(should_retry_messages_error(
+            MessagesErrorKind::MissingHeartbeat
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_terminal_pull_errors() {
+        assert!(!should_retry_messages_error(
+            MessagesErrorKind::ConsumerDeleted
+        ));
+        assert!(!should_retry_messages_error(
+            MessagesErrorKind::PushBasedConsumer
+        ));
+    }
+
+    #[test]
+    fn retry_delay_caps_at_maximum() {
+        assert_eq!(
+            next_retry_delay(INITIAL_RETRY_DELAY),
+            Duration::from_millis(500)
+        );
+        assert_eq!(next_retry_delay(MAX_RETRY_DELAY), MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn uses_latest_seen_sequence_when_recreating_consumer() {
+        let mut sequence_numbers = HashMap::new();
+        sequence_numbers.insert(
+            "operator_1".to_string(),
+            NatsState {
+                stream_name: "orders".to_string(),
+                stream_sequence_number: 41,
+            },
+        );
+
+        assert_eq!(
+            current_stream_sequence(&sequence_numbers, "operator_1", 10),
+            42
+        );
+        assert_eq!(
+            current_stream_sequence(&sequence_numbers, "operator_2", 10),
+            10
+        );
+    }
+
+    #[test]
+    fn stream_end_retry_logging_is_nonfatal() {
+        retry_delay_after_stream_end("orders", INITIAL_RETRY_DELAY);
     }
 }
